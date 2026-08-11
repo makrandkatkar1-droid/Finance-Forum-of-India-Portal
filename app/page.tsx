@@ -8,6 +8,15 @@ type Batch = { id: string; name: string };
 
 const THEME = { green: "#7BBA27", greenDark: "#5C9420", navy: "#0B1D2E", bg: "#F5F6F1", border: "#E4E1D8", textMuted: "#6B6A63" };
 
+// Forces light-themed form controls (background/text) regardless of the
+// visitor's OS/browser dark-mode setting, which otherwise can make input
+// text render white-on-white and become invisible.
+const inputStyle: React.CSSProperties = {
+  colorScheme: "light",
+  color: "#111111",
+  backgroundColor: "#FFFFFF",
+};
+
 export default function LoginPage() {
   const router = useRouter();
   const [checkedSession, setCheckedSession] = useState(false);
@@ -98,7 +107,7 @@ export default function LoginPage() {
               <div className="flex gap-2 p-2.5 rounded-2xl bg-white/10">
                 <input value={newBatchName} onChange={(e) => setNewBatchName(e.target.value)} autoFocus placeholder="New batch name"
                   onKeyDown={(e) => { if (e.key === "Enter") addBatch(); }}
-                  className="flex-1 px-3 py-2.5 rounded-lg text-sm" />
+                  className="flex-1 px-3 py-2.5 rounded-lg text-sm" style={inputStyle} />
                 <button onClick={addBatch} className="px-4 py-2.5 rounded-lg font-semibold text-white" style={{ background: THEME.green }}>Add</button>
                 <button onClick={() => { setAddingBatch(false); setNewBatchName(""); }} className="px-3 py-2.5 rounded-lg text-white bg-white/20">Cancel</button>
               </div>
@@ -144,10 +153,12 @@ export default function LoginPage() {
         <form onSubmit={handleSubmit}>
           <label className="text-xs font-semibold" style={{ color: THEME.navy }}>Username</label>
           <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username"
-            className="w-full px-3.5 py-3 mt-1.5 mb-4 rounded-lg text-sm outline-none border-2 border-[#D8D4C6] focus:border-green-600" />
+            className="w-full px-3.5 py-3 mt-1.5 mb-4 rounded-lg text-sm outline-none border-2 border-[#D8D4C6] focus:border-green-600"
+            style={inputStyle} />
           <label className="text-xs font-semibold" style={{ color: THEME.navy }}>Password</label>
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password"
-            className="w-full px-3.5 py-3 mt-1.5 mb-5 rounded-lg text-sm outline-none border-2 border-[#D8D4C6] focus:border-green-600" />
+            className="w-full px-3.5 py-3 mt-1.5 mb-5 rounded-lg text-sm outline-none border-2 border-[#D8D4C6] focus:border-green-600"
+            style={inputStyle} />
           {error && <div className="text-sm mb-3.5 px-3 py-2 rounded-lg" style={{ color: "#A32D2D", background: "#FCEBEB" }}>{error}</div>}
           <button type="submit" disabled={loading}
             className="w-full py-3 rounded-lg text-white text-[15px] font-bold disabled:opacity-60" style={{ background: THEME.green }}>
