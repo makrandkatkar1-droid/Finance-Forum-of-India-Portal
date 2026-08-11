@@ -3,14 +3,19 @@ import bcrypt from "bcryptjs";
 import { query, logAudit } from "@/lib/db";
 import { getSession } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const session = await getSession();
   if (!session || session.role !== "admin") return NextResponse.json({ error: "Admin access only." }, { status: 403 });
 
+  const batchId = req.nextUrl.searchParams.get("batchId");
+
   const admin = await query("SELECT id, username FROM users WHERE role = 'admin' LIMIT 1");
   const faculty = await query(
-    `SELECT u.id, u.name, u.username, u.pay_rate, c.name AS course_name FROM users u
-     LEFT JOIN courses c ON c.faculty_id = u.id WHERE u.role = 'faculty' ORDER BY u.name`
+    `SELECT u.id, u.name, u.username, u.pay_rate, c.id AS course_id, c.name AS course_name, c.batch_id FROM users u
+     LEFT JOIN courses c ON c.faculty_id = u.id WHERE u.role = 'faculty'
+     ${batchId ? "AND c.batch_id = $1" : ""}
+     ORDER BY u.name`,
+    batchId ? [batchId] : []
   );
 
   return NextResponse.json({
