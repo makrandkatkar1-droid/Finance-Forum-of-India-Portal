@@ -59,11 +59,6 @@ function weekParityLabel(parity: string | null) {
   if (parity === "even") return "Even weeks";
   return null;
 }
-function weekParityForDate(date: Date) {
-  const epoch = new Date(2026, 0, 5);
-  const diffDays = Math.floor((date.getTime() - epoch.getTime()) / (1000 * 60 * 60 * 24));
-  return Math.floor(diffDays / 7) % 2 === 0 ? "even" : "odd";
-}
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function daysInMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); }
 function mondayIndex(jsDay: number) { return (jsDay + 6) % 7; }
@@ -206,7 +201,7 @@ export default function DashboardPage() {
           </div>
 
           {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }} />}
-          {activeTab === "monthly" && <MonthlyCalendar courses={courses} isAdmin={isAdmin} batchId={batchId} onChanged={refresh} />}
+          {activeTab === "monthly" && <MonthlyCalendar courses={courses} isAdmin={isAdmin} batchId={batchId} students={students} onChanged={refresh} />}
           {activeTab === "weekly-sched" && (
             <WeeklyCalendar courses={courses} user={user}
               onChangeDay={async (cid: string, day: string) => { await api(`/api/courses/${cid}`, { method: "PATCH", body: JSON.stringify({ dayAllocated: day }) }); loadCourses(batchId); }}
@@ -216,7 +211,7 @@ export default function DashboardPage() {
           {activeTab === "credentials" && isAdmin && <CredentialsPanel students={students} onStudentsChanged={() => loadStudents(batchId)} />}
           {activeTab === "audit" && isAdmin && <AuditLog log={auditLog} />}
           {activeTab === "batches" && isAdmin && <BatchesPanel batches={batches} onChanged={() => api("/api/batches").then((d) => setBatches(d.batches || []))} />}
-          {activeTab === "payout" && isAdmin && <FacultyPayout />}
+          {activeTab === "payout" && isAdmin && <FacultyPayout batchId={batchId} />}
           {activeTab === "fees" && isAdmin && <StudentFees batchId={batchId} students={students} onStudentsChanged={() => loadStudents(batchId)} />}
           {activeTab === "myresults" && user.role === "student" && <MyResults courses={courses} studentId={user.studentId!} />}
 
@@ -517,11 +512,53 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
   );
 }
 
-function MonthlyCalendar({ courses, isAdmin, batchId, onChanged }: { courses: CourseSummary[]; isAdmin: boolean; batchId: string; onChanged: () => void }) {
+function EventAttendancePanel({ eventId, students }: { eventId: string; students: StudentRow[] }) {
+  const [records, setRecords] = useState<Record<string, boolean>>({});
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    const d = await api(`/api/calendar-events/${eventId}/attendance`);
+    setRecords(d.records || {});
+    setLoading(false);
+  }, [eventId]);
+  useEffect(() => { load(); }, [load]);
+
+  const toggle = async (studentRosterId: string, current: boolean) => {
+    setRecords((r) => ({ ...r, [studentRosterId]: !current }));
+    await api(`/api/calendar-events/${eventId}/attendance`, { method: "POST", body: JSON.stringify({ studentRosterId, present: !current }) });
+  };
+
+  if (loading) return <div style={{ padding: "10px 16px", fontSize: 12, color: THEME.textFaint }}>Loading attendance...</div>;
+
+  const presentCount = Object.values(records).filter(Boolean).length;
+
+  return (
+    <div style={{ padding: "12px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.bg }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: THEME.navy, marginBottom: 8 }}>
+        Attendance — {presentCount} / {students.length} present
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+        {students.map((s) => {
+          const present = !!records[s.id];
+          const displayName = s.name?.trim() ? s.name : s.label;
+          return (
+            <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, padding: "4px 6px", borderRadius: 6, background: present ? THEME.greenLight : THEME.card, cursor: "pointer" }}>
+              <input type="checkbox" checked={present} onChange={() => toggle(s.id, present)} style={{ width: 14, height: 14 }} />
+              <span style={{ color: present ? THEME.greenDark : THEME.textMuted, fontWeight: present ? 600 : 400 }}>{displayName}</span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MonthlyCalendar({ courses, isAdmin, batchId, students, onChanged }: { courses: CourseSummary[]; isAdmin: boolean; batchId: string; students: StudentRow[]; onChanged: () => void }) {
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
   const [events, setEvents] = useState<any[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ date: "", title: "", note: "" });
+  const [expandedEventId, setExpandedEventId] = useState<string | null>(null);
 
   const loadEvents = useCallback(() => { api("/api/calendar-events").then((d) => setEvents(d.events || [])); }, []);
   useEffect(() => { loadEvents(); }, [loadEvents]);
@@ -653,15 +690,28 @@ function MonthlyCalendar({ courses, isAdmin, batchId, onChanged }: { courses: Co
         <div>
           <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 10 }}>Guest lectures & events</div>
           <div style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, overflow: "hidden" }}>
-            {upcoming.map((e, i) => (
-              <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: i < upcoming.length - 1 ? `1px solid ${THEME.border}` : "none" }}>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: THEME.navy }}>{e.label}</div>
-                  <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 2 }}>{new Date(e.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}{e.courseName ? ` · ${e.courseName}` : ""}</div>
+            {upcoming.map((e, i) => {
+              const expanded = expandedEventId === e.id;
+              return (
+                <div key={e.id} style={{ borderBottom: i < upcoming.length - 1 ? `1px solid ${THEME.border}` : "none" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px" }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: THEME.navy }}>{e.label}</div>
+                      <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 2 }}>{new Date(e.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}{e.courseName ? ` · ${e.courseName}` : ""}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+                      {isAdmin && (
+                        <button onClick={() => setExpandedEventId(expanded ? null : e.id)} style={{ fontSize: 11.5, background: "none", border: "none", color: THEME.greenDark, cursor: "pointer", fontWeight: 600 }}>
+                          {expanded ? "Hide attendance" : "Take attendance"}
+                        </button>
+                      )}
+                      {isAdmin && <button onClick={() => removeEvent(e.id)} style={{ fontSize: 11.5, background: "none", border: "none", color: THEME.textFaint, cursor: "pointer" }}>Remove</button>}
+                    </div>
+                  </div>
+                  {expanded && <EventAttendancePanel eventId={e.id} students={students} />}
                 </div>
-                {isAdmin && <button onClick={() => removeEvent(e.id)} style={{ fontSize: 11.5, background: "none", border: "none", color: THEME.textFaint, cursor: "pointer" }}>Remove</button>}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -1047,7 +1097,7 @@ function Marks({ detail, students, courseId, isAdmin, onRefresh }: { detail: Cou
         row[`${c.component_name} (/${c.max_marks})`] = val;
       });
       const formativeTotal = computeFormativeTotal(detail, s.id);
-      const summative = (detail.summativeMarks[s.id] as number | undefined) ?? "";
+      const summative = detail.summativeMarks[s.id] ?? "";
       row["Formative total (/50)"] = formativeTotal;
       row["External / Summative (/50)"] = summative;
       row["Grand total (/100)"] = formativeTotal + (Number(summative) || 0);
@@ -1169,22 +1219,30 @@ function Attendance({ detail, students, courseId, onRefresh }: { detail: CourseD
   );
 }
 
-function FacultyPayout() {
+function FacultyPayout({ batchId }: { batchId: string }) {
   const [facultyList, setFacultyList] = useState<any[]>([]);
   const [facultyId, setFacultyId] = useState("");
   const [sessions, setSessions] = useState<any[]>([]);
   const [newDate, setNewDate] = useState(""); const [newTopic, setNewTopic] = useState(""); const [newHours, setNewHours] = useState(2);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
 
-  useEffect(() => { api("/api/admin/credentials").then((d) => { setFacultyList(d.faculty); if (d.faculty[0]) setFacultyId(d.faculty[0].id); }); }, []);
-  const loadSessions = useCallback(async (fid: string) => { if (!fid) return; const d = await api(`/api/faculty-sessions?facultyId=${fid}`); setSessions(d.sessions || []); }, []);
+  // Only faculty who teach a course in the CURRENT batch show up here —
+  // this is what stops "logging hours in IBOP" from touching FFOI Powered's faculty.
+  useEffect(() => {
+    api(`/api/admin/credentials?batchId=${batchId}`).then((d) => {
+      setFacultyList(d.faculty);
+      setFacultyId(d.faculty[0]?.id || "");
+    });
+  }, [batchId]);
+
+  const loadSessions = useCallback(async (fid: string) => { if (!fid) { setSessions([]); return; } const d = await api(`/api/faculty-sessions?facultyId=${fid}`); setSessions(d.sessions || []); }, []);
   useEffect(() => { loadSessions(facultyId); }, [facultyId, loadSessions]);
 
   const faculty = facultyList.find((f) => f.id === facultyId);
 
   const addSession = async () => {
-    if (!newDate || !newHours) return;
-    await api("/api/faculty-sessions", { method: "POST", body: JSON.stringify({ facultyId, courseId: faculty?.course_name ? undefined : undefined, date: newDate, topic: newTopic, hours: Number(newHours), rate: faculty?.pay_rate || 0 }) });
+    if (!newDate || !newHours || !facultyId) return;
+    await api("/api/faculty-sessions", { method: "POST", body: JSON.stringify({ facultyId, courseId: faculty?.course_id || null, date: newDate, topic: newTopic, hours: Number(newHours), rate: faculty?.pay_rate || 0 }) });
     setNewDate(""); setNewTopic(""); setNewHours(2);
     loadSessions(facultyId);
   };
@@ -1200,55 +1258,61 @@ function FacultyPayout() {
     <div>
       <div style={{ marginBottom: 24 }}>
         <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Faculty payouts</div>
-        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Log hours worked per day. Pay rate comes from Credentials, editable per entry too.</div>
+        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Log hours worked per day. Only faculty teaching in this batch are listed here.</div>
       </div>
 
-      <div style={{ marginBottom: 20 }}>
-        <label style={{ fontSize: 12, color: THEME.textMuted }}>Faculty</label><br />
-        <select value={facultyId} onChange={(e) => setFacultyId(e.target.value)} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, minWidth: 220 }}>
-          {facultyList.map((f) => <option key={f.id} value={f.id}>{f.name} — {f.pay_rate ? `₹${f.pay_rate}/hr` : "no rate set"}</option>)}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 20, padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
-        <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Date</label><br /><input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13 }} /></div>
-        <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Topic (optional)</label><br /><input value={newTopic} onChange={(e) => setNewTopic(e.target.value)} placeholder="What was covered" style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, width: 180 }} /></div>
-        <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Hours worked</label><br /><input type="number" min={0} step={0.5} value={newHours} onChange={(e) => setNewHours(Number(e.target.value))} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, width: 80 }} /></div>
-        <button onClick={addSession} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Add entry</button>
-      </div>
-
-      {sessions.length === 0 ? <div style={{ color: THEME.textFaint, fontSize: 13 }}>No hours logged yet for this faculty member.</div> : (
+      {facultyList.length === 0 ? (
+        <div style={{ color: THEME.textFaint, fontSize: 13 }}>No faculty are teaching a course in this batch yet, so there's nothing to log payouts for.</div>
+      ) : (
         <>
-          <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, minWidth: 780 }}>
-              <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg, textAlign: "left" }}>
-                <th style={{ padding: "8px" }}></th><th style={{ padding: "8px" }}>Date</th><th style={{ padding: "8px" }}>Topic</th>
-                <th style={{ padding: "8px", textAlign: "center" }}>Hours</th><th style={{ padding: "8px", textAlign: "center" }}>Rate (₹/hr)</th>
-                <th style={{ padding: "8px", textAlign: "center" }}>Total (₹)</th><th style={{ padding: "8px", textAlign: "center" }}>Paid?</th><th style={{ padding: "8px" }}></th>
-              </tr></thead>
-              <tbody>
-                {sessions.map((s) => {
-                  const rowTotal = (Number(s.hours) || 0) * (Number(s.rate) || 0);
-                  return (
-                    <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
-                      <td style={{ padding: "6px 8px" }}><input type="checkbox" checked={!!selected[s.id]} onChange={() => toggleSelect(s.id)} disabled={s.paid} /></td>
-                      <td style={{ padding: "6px 8px" }}>{new Date(s.session_date).toLocaleDateString("en-IN")}</td>
-                      <td style={{ padding: "6px 8px" }}>{s.topic || "—"}</td>
-                      <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" min={0} step={0.5} defaultValue={s.hours} onBlur={(e) => updateSession(s.id, { hours: Number(e.target.value) })} style={{ width: 55, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
-                      <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" defaultValue={s.rate} onBlur={(e) => updateSession(s.id, { rate: Number(e.target.value) })} style={{ width: 65, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
-                      <td style={{ padding: "6px 8px", textAlign: "center", fontWeight: 700, color: THEME.greenDark }}>₹{rowTotal.toLocaleString("en-IN")}</td>
-                      <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => updateSession(s.id, { paid: !s.paid })} style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 20, border: "none", cursor: "pointer", background: s.paid ? THEME.greenLight : "#FCEBEB", color: s.paid ? THEME.greenDark : "#A32D2D" }}>{s.paid ? "Paid" : "Unpaid"}</button></td>
-                      <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => removeSession(s.id)} style={{ fontSize: 11, background: "none", border: "none", color: THEME.textFaint, cursor: "pointer" }}>Remove</button></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+          <div style={{ marginBottom: 20 }}>
+            <label style={{ fontSize: 12, color: THEME.textMuted }}>Faculty</label><br />
+            <select value={facultyId} onChange={(e) => setFacultyId(e.target.value)} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, minWidth: 220 }}>
+              {facultyList.map((f) => <option key={f.id} value={f.id}>{f.name} — {f.pay_rate ? `₹${f.pay_rate}/hr` : "no rate set"}</option>)}
+            </select>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14, flexWrap: "wrap", gap: 10 }}>
-            <div style={{ fontSize: 13.5, color: THEME.textMuted }}>Total (all time): <strong style={{ color: THEME.navy }}>₹{totalAll.toLocaleString("en-IN")}</strong> · Still owed: <strong style={{ color: "#A32D2D" }}>₹{totalUnpaid.toLocaleString("en-IN")}</strong></div>
-            <button onClick={markSelectedPaid} disabled={!Object.values(selected).some(Boolean)} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.navy, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer", opacity: Object.values(selected).some(Boolean) ? 1 : 0.5 }}>Mark selected as Paid</button>
+
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 20, padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
+            <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Date</label><br /><input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13 }} /></div>
+            <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Topic (optional)</label><br /><input value={newTopic} onChange={(e) => setNewTopic(e.target.value)} placeholder="What was covered" style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, width: 180 }} /></div>
+            <div><label style={{ fontSize: 12, color: THEME.textMuted }}>Hours worked</label><br /><input type="number" min={0} step={0.5} value={newHours} onChange={(e) => setNewHours(Number(e.target.value))} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, width: 80 }} /></div>
+            <button onClick={addSession} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Add entry</button>
           </div>
+
+          {sessions.length === 0 ? <div style={{ color: THEME.textFaint, fontSize: 13 }}>No hours logged yet for this faculty member.</div> : (
+            <>
+              <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, minWidth: 780 }}>
+                  <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg, textAlign: "left" }}>
+                    <th style={{ padding: "8px" }}></th><th style={{ padding: "8px" }}>Date</th><th style={{ padding: "8px" }}>Topic</th>
+                    <th style={{ padding: "8px", textAlign: "center" }}>Hours</th><th style={{ padding: "8px", textAlign: "center" }}>Rate (₹/hr)</th>
+                    <th style={{ padding: "8px", textAlign: "center" }}>Total (₹)</th><th style={{ padding: "8px", textAlign: "center" }}>Paid?</th><th style={{ padding: "8px" }}></th>
+                  </tr></thead>
+                  <tbody>
+                    {sessions.map((s) => {
+                      const rowTotal = (Number(s.hours) || 0) * (Number(s.rate) || 0);
+                      return (
+                        <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
+                          <td style={{ padding: "6px 8px" }}><input type="checkbox" checked={!!selected[s.id]} onChange={() => toggleSelect(s.id)} disabled={s.paid} /></td>
+                          <td style={{ padding: "6px 8px" }}>{new Date(s.session_date).toLocaleDateString("en-IN")}</td>
+                          <td style={{ padding: "6px 8px" }}>{s.topic || "—"}</td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" min={0} step={0.5} defaultValue={s.hours} onBlur={(e) => updateSession(s.id, { hours: Number(e.target.value) })} style={{ width: 55, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" defaultValue={s.rate} onBlur={(e) => updateSession(s.id, { rate: Number(e.target.value) })} style={{ width: 65, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
+                          <td style={{ padding: "6px 8px", textAlign: "center", fontWeight: 700, color: THEME.greenDark }}>₹{rowTotal.toLocaleString("en-IN")}</td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => updateSession(s.id, { paid: !s.paid })} style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 20, border: "none", cursor: "pointer", background: s.paid ? THEME.greenLight : "#FCEBEB", color: s.paid ? THEME.greenDark : "#A32D2D" }}>{s.paid ? "Paid" : "Unpaid"}</button></td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => removeSession(s.id)} style={{ fontSize: 11, background: "none", border: "none", color: THEME.textFaint, cursor: "pointer" }}>Remove</button></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14, flexWrap: "wrap", gap: 10 }}>
+                <div style={{ fontSize: 13.5, color: THEME.textMuted }}>Total (all time): <strong style={{ color: THEME.navy }}>₹{totalAll.toLocaleString("en-IN")}</strong> · Still owed: <strong style={{ color: "#A32D2D" }}>₹{totalUnpaid.toLocaleString("en-IN")}</strong></div>
+                <button onClick={markSelectedPaid} disabled={!Object.values(selected).some(Boolean)} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.navy, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer", opacity: Object.values(selected).some(Boolean) ? 1 : 0.5 }}>Mark selected as Paid</button>
+              </div>
+            </>
+          )}
         </>
       )}
     </div>
