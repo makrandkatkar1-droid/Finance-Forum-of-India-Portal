@@ -83,6 +83,7 @@ async function api(url: string, options?: RequestInit) {
   }
   return res.json();
 }
+
 export default function DashboardPage() {
   const router = useRouter();
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -200,7 +201,7 @@ export default function DashboardPage() {
             <NotificationBell />
           </div>
 
-          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }} />}
+          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} batchId={batchId} onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }} />}
           {activeTab === "monthly" && <MonthlyCalendar courses={courses} isAdmin={isAdmin} batchId={batchId} students={students} onChanged={refresh} />}
           {activeTab === "weekly-sched" && (
             <WeeklyCalendar courses={courses} user={user}
@@ -345,7 +346,7 @@ function StatCard({ icon: Icon, label, value, sub, accent }: any) {
   );
 }
 
-function OrgDashboard({ courses, onSelectCourse }: { courses: CourseSummary[]; onSelectCourse: (id: string) => void }) {
+function OrgDashboard({ courses, batchId, onSelectCourse }: { courses: CourseSummary[]; batchId: string; onSelectCourse: (id: string) => void }) {
   const [stats, setStats] = useState<any>(null);
   const [progress, setProgress] = useState<Record<string, number>>({});
   const [attendanceByCourse, setAttendanceByCourse] = useState<any[]>([]);
@@ -409,7 +410,7 @@ function OrgDashboard({ courses, onSelectCourse }: { courses: CourseSummary[]; o
             sub={`${stats.totalModules ? Math.round((stats.completedModules / stats.totalModules) * 100) : 0}% completed org-wide`} accent={THEME.green} />
           <StatCard icon={ClipboardList} label="Upcoming deadlines" value={stats.upcomingCount} sub={stats.nextAssignment ? `Next: ${stats.nextAssignment}` : "None scheduled"} />
           <StatCard icon={FileText} label="Upcoming tests" value={stats.testCount} sub={stats.nextTestDate ? `Next: ${new Date(stats.nextTestDate).toLocaleDateString("en-IN")}` : "None scheduled"} />
-          <StatCard icon={ClipboardCheck} label="Average attendance" value={overallAvgAttendance !== null ? `${overallAvgAttendance}%` : "No data yet"} sub="Across all students, this batch" accent={overallAvgAttendance !== null && overallAvgAttendance < 75 ? "#C23B3B" : THEME.green} />
+          <StatCard icon={ClipboardCheck} label="Average attendance" value={overallAvgAttendance !== null ? `${overallAvgAttendance}%` : "No data yet"} sub="Course lectures only — see combined below" accent={overallAvgAttendance !== null && overallAvgAttendance < 75 ? "#C23B3B" : THEME.green} />
           <StatCard icon={Users} label="Faculty" value={courses.length} sub="Active courses" />
         </div>
       )}
@@ -430,6 +431,8 @@ function OrgDashboard({ courses, onSelectCourse }: { courses: CourseSummary[]; o
           </div>
         </>
       )}
+
+      <CombinedAttendanceTable batchId={batchId} />
 
       <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 12 }}>Course progress</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -455,6 +458,50 @@ function OrgDashboard({ courses, onSelectCourse }: { courses: CourseSummary[]; o
         })}
       </div>
     </div>
+  );
+}
+
+function CombinedAttendanceTable({ batchId }: { batchId: string }) {
+  const [data, setData] = useState<any>(null);
+
+  useEffect(() => { api(`/api/attendance-summary?batchId=${batchId}`).then(setData); }, [batchId]);
+
+  if (!data) return null;
+
+  return (
+    <>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 6 }}>Combined attendance (courses + guest events)</div>
+      <div style={{ fontSize: 12, color: THEME.textMuted, marginBottom: 12 }}>
+        {data.totalCourseSessions} course session{data.totalCourseSessions !== 1 ? "s" : ""} + {data.totalEvents} event{data.totalEvents !== 1 ? "s" : ""} = {data.totalDenominator} total, per student.
+        {data.overallAvg !== null && <> Batch average: <strong style={{ color: THEME.navy }}>{data.overallAvg}%</strong>.</>}
+      </div>
+      {data.totalDenominator === 0 ? (
+        <div style={{ color: THEME.textFaint, fontSize: 13, marginBottom: 28 }}>No course lecture sessions or events logged yet for this batch.</div>
+      ) : (
+        <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 28 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg, textAlign: "left" }}>
+                <th style={{ padding: "8px 12px" }}>Student</th>
+                <th style={{ padding: "8px 12px", textAlign: "center" }}>Course sessions attended</th>
+                <th style={{ padding: "8px 12px", textAlign: "center" }}>Events attended</th>
+                <th style={{ padding: "8px 12px", textAlign: "center" }}>Overall</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.students.map((s: any) => (
+                <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
+                  <td style={{ padding: "7px 12px" }}>{s.name}</td>
+                  <td style={{ padding: "7px 12px", textAlign: "center" }}>{s.coursePresent} / {data.totalCourseSessions}</td>
+                  <td style={{ padding: "7px 12px", textAlign: "center" }}>{s.eventPresent} / {data.totalEvents}</td>
+                  <td style={{ padding: "7px 12px", textAlign: "center", fontWeight: 700, color: s.pct !== null && s.pct < 75 ? "#A32D2D" : THEME.greenDark }}>{s.pct !== null ? `${s.pct}%` : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -511,7 +558,6 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
     </div>
   );
 }
-
 function EventAttendancePanel({ eventId, students }: { eventId: string; students: StudentRow[] }) {
   const [records, setRecords] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
@@ -1226,8 +1272,6 @@ function FacultyPayout({ batchId }: { batchId: string }) {
   const [newDate, setNewDate] = useState(""); const [newTopic, setNewTopic] = useState(""); const [newHours, setNewHours] = useState(2);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
 
-  // Only faculty who teach a course in the CURRENT batch show up here —
-  // this is what stops "logging hours in IBOP" from touching FFOI Powered's faculty.
   useEffect(() => {
     api(`/api/admin/credentials?batchId=${batchId}`).then((d) => {
       setFacultyList(d.faculty);
