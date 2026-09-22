@@ -1,15 +1,18 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
+import type { ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import * as XLSX from "xlsx";
+import type { MisData } from "@/lib/misReport";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import {
   LayoutDashboard, BookOpen, CheckCircle2, CalendarDays, ClipboardList,
   FileText, Award, History, LogOut, Users, TrendingUp, Clock,
   ChevronRight, ChevronLeft, CalendarClock, CalendarRange, Settings,
   ClipboardCheck, Bell, X, Download, Wallet, Receipt, Layers, Plus, CheckCircle,
+  Save, Trash2, FileChartColumn, TriangleAlert,
 } from "lucide-react";
 
 const THEME = {
@@ -84,6 +87,130 @@ async function api(url: string, options?: RequestInit) {
   return res.json();
 }
 
+// ─────────────────────────────────────────────────────────────
+// SAVE SYSTEM
+// Edits are held as a draft until the user clicks Save. Leaving a page
+// (switching tab/course, logging out, closing the browser) with unsaved
+// changes asks for confirmation first.
+// ─────────────────────────────────────────────────────────────
+const dirtyPanels = new Set<string>();
+
+function confirmLeave(): boolean {
+  if (dirtyPanels.size === 0) return true;
+  const ok = window.confirm("You have unsaved changes. Leave without saving them?");
+  if (ok) dirtyPanels.clear();
+  return ok;
+}
+
+type DraftChange = { value: any; commit: (value: any) => Promise<unknown> };
+type Draft = ReturnType<typeof useDraft>;
+
+function useDraft(panelId: string, onSaved?: () => unknown) {
+  const [changes, setChanges] = useState<Record<string, DraftChange>>({});
+  const [version, setVersion] = useState(0);
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [error, setError] = useState("");
+  const count = Object.keys(changes).length;
+
+  useEffect(() => {
+    if (count > 0) dirtyPanels.add(panelId); else dirtyPanels.delete(panelId);
+    return () => { dirtyPanels.delete(panelId); };
+  }, [count, panelId]);
+
+  useEffect(() => {
+    if (count === 0) return;
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [count]);
+
+  // Stage a change. If the new value equals the original, the change is dropped.
+  const stage = useCallback((key: string, value: any, commit: (value: any) => Promise<unknown>, original?: any) => {
+    setStatus((s) => (s === "saved" ? "idle" : s));
+    setChanges((c) => {
+      if (original !== undefined && String(value ?? "") === String(original ?? "")) {
+        if (!(key in c)) return c;
+        const next = { ...c }; delete next[key]; return next;
+      }
+      return { ...c, [key]: { value, commit } };
+    });
+  }, []);
+
+  const drop = useCallback((match: (key: string) => boolean) => {
+    setChanges((c) => Object.fromEntries(Object.entries(c).filter(([k]) => !match(k))));
+  }, []);
+
+  const get = <T,>(key: string, fallback: T): T => (key in changes ? changes[key].value : fallback);
+  const has = (key: string) => key in changes;
+
+  const save = async () => {
+    const entries = Object.entries(changes);
+    if (entries.length === 0) return;
+    setStatus("saving"); setError("");
+    const failed: Record<string, DraftChange> = {};
+    let firstError = "";
+    // Run up to 6 saves at a time so large edits (e.g. a full attendance sheet) stay quick.
+    const queue = [...entries];
+    await Promise.all(Array.from({ length: Math.min(6, queue.length) }, async () => {
+      while (queue.length) {
+        const [key, ch] = queue.shift()!;
+        try { await ch.commit(ch.value); } catch (e: any) { failed[key] = ch; firstError ||= e?.message || "Save failed"; }
+      }
+    }));
+    try { await onSaved?.(); } catch { /* reload failure shouldn't hide the save result */ }
+    setChanges(failed);
+    setVersion((v) => v + 1);
+    const failedCount = Object.keys(failed).length;
+    if (failedCount) {
+      setStatus("error");
+      setError(`${failedCount} change${failedCount > 1 ? "s" : ""} could not be saved: ${firstError}`);
+    } else {
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 2500);
+    }
+  };
+
+  const discard = () => { setChanges({}); setVersion((v) => v + 1); setStatus("idle"); setError(""); };
+
+  return { stage, drop, get, has, save, discard, count, version, status, error };
+}
+
+function SaveBar({ draft, compact = false }: { draft: Draft; compact?: boolean }) {
+  const dirty = draft.count > 0;
+  const saving = draft.status === "saving";
+  let message: ReactNode;
+  if (saving) message = "Saving…";
+  else if (draft.status === "error") message = <span style={{ color: "#A32D2D" }}>{draft.error}</span>;
+  else if (dirty) message = <span style={{ color: THEME.orange, fontWeight: 600 }}>{draft.count} unsaved change{draft.count > 1 ? "s" : ""}</span>;
+  else if (draft.status === "saved") message = <span style={{ color: THEME.greenDark, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}><CheckCircle size={14} /> Saved</span>;
+  else message = <span style={{ color: THEME.textFaint }}>All changes saved</span>;
+
+  return (
+    <div style={{
+      position: compact ? "static" : "sticky", bottom: compact ? undefined : 12, zIndex: 15,
+      display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap",
+      marginTop: compact ? 10 : 16, padding: compact ? "8px 10px" : "10px 14px", borderRadius: 10,
+      border: `1px solid ${dirty ? THEME.orange : THEME.border}`, background: dirty ? "#FFFBF4" : THEME.card,
+      boxShadow: dirty && !compact ? "0 6px 20px rgba(11,29,46,0.12)" : "none", fontSize: 12.5,
+    }}>
+      <div>{message}</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        {dirty && !saving && (
+          <button onClick={draft.discard} style={{ padding: "7px 14px", borderRadius: 7, border: `1px solid ${THEME.border}`, background: THEME.card, fontSize: 12.5, cursor: "pointer", color: THEME.textMuted }}>Discard</button>
+        )}
+        <button onClick={draft.save} disabled={!dirty || saving}
+          style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 18px", borderRadius: 7, border: "none", fontSize: 12.5, fontWeight: 700,
+            background: dirty ? THEME.green : "#DCDAD2", color: dirty ? "white" : THEME.textFaint, cursor: dirty && !saving ? "pointer" : "default" }}>
+          <Save size={14} /> {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Style applied to an input whose value has changed but isn't saved yet.
+const dirtyStyle = (isDirty: boolean) => (isDirty ? { borderColor: THEME.orange, background: "#FFF7EA" } : {});
+
 export default function DashboardPage() {
   const router = useRouter();
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -143,13 +270,22 @@ export default function DashboardPage() {
   }, [activeTab, user]);
 
   const refresh = () => setRefreshKey((k) => k + 1);
+  // Awaitable reload of the open course, used after a Save so fresh values are on screen.
+  const reloadDetail = async () => { const id = activeCourseId; if (id) await loadDetail(id); };
+
+  // Every navigation goes through here so unsaved changes are never lost silently.
+  const go = (fn: () => void) => { if (confirmLeave()) fn(); };
+  const openTab = (tab: string) => go(() => setActiveTab(tab));
+  const openCourse = (id: string) => go(() => { setActiveCourseId(id); setActiveTab("home"); });
 
   async function handleLogout() {
+    if (!confirmLeave()) return;
     await api("/api/auth/logout", { method: "POST" });
     router.replace("/");
   }
 
   function changeBatch() {
+    if (!confirmLeave()) return;
     if (typeof window !== "undefined") localStorage.removeItem("ffoi_batch_id");
     handleLogout();
   }
@@ -176,23 +312,24 @@ export default function DashboardPage() {
     marks: { label: "Marks", icon: Award },
     attendance: { label: "Attendance", icon: ClipboardCheck },
   };
-  const GLOBAL_TABS = ["org", "monthly", "weekly-sched", "credentials", "audit", "batches", "payout", "fees", "myresults"];
+  const GLOBAL_TABS = ["org", "monthly", "weekly-sched", "credentials", "audit", "batches", "payout", "fees", "myresults", "reports"];
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", background: THEME.bg }}>
       <Sidebar
         user={user} courses={courses} activeCourseId={courseId} batchName={batchName}
-        onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }}
+        onSelectCourse={openCourse}
         onLogout={handleLogout} onChangeBatch={changeBatch} activeTab={activeTab}
-        onOpenOrg={() => setActiveTab("org")}
-        onOpenMonthly={() => setActiveTab("monthly")}
-        onOpenWeeklySched={() => setActiveTab("weekly-sched")}
-        onOpenCredentials={() => setActiveTab("credentials")}
-        onOpenAudit={() => setActiveTab("audit")}
-        onOpenBatches={() => setActiveTab("batches")}
-        onOpenPayout={() => setActiveTab("payout")}
-        onOpenFees={() => setActiveTab("fees")}
-        onOpenMyResults={() => setActiveTab("myresults")}
+        onOpenOrg={() => openTab("org")}
+        onOpenMonthly={() => openTab("monthly")}
+        onOpenWeeklySched={() => openTab("weekly-sched")}
+        onOpenCredentials={() => openTab("credentials")}
+        onOpenAudit={() => openTab("audit")}
+        onOpenBatches={() => openTab("batches")}
+        onOpenPayout={() => openTab("payout")}
+        onOpenFees={() => openTab("fees")}
+        onOpenMyResults={() => openTab("myresults")}
+        onOpenReports={() => openTab("reports")}
       />
 
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -201,15 +338,15 @@ export default function DashboardPage() {
             <NotificationBell />
           </div>
 
-          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} batchId={batchId} onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }} />}
+          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} batchId={batchId} onSelectCourse={openCourse} onOpenReports={() => openTab("reports")} />}
+          {activeTab === "reports" && isAdmin && <MisReports courses={courses} batchId={batchId} batchName={batchName} />}
           {activeTab === "monthly" && <MonthlyCalendar courses={courses} isAdmin={isAdmin} batchId={batchId} students={students} onChanged={refresh} />}
           {activeTab === "weekly-sched" && (
             <WeeklyCalendar courses={courses} user={user}
-              onChangeDay={async (cid: string, day: string) => { await api(`/api/courses/${cid}`, { method: "PATCH", body: JSON.stringify({ dayAllocated: day }) }); loadCourses(batchId); }}
-              onChangeParity={async (cid: string, parity: string | null) => { await api(`/api/courses/${cid}`, { method: "PATCH", body: JSON.stringify({ dayParity: parity }) }); loadCourses(batchId); }}
-              onSelectCourse={(id: string) => { setActiveCourseId(id); setActiveTab("home"); }} />
+              onSaved={() => loadCourses(batchId)}
+              onSelectCourse={openCourse} />
           )}
-          {activeTab === "credentials" && isAdmin && <CredentialsPanel students={students} onStudentsChanged={() => loadStudents(batchId)} />}
+          {activeTab === "credentials" && isAdmin && <CredentialsPanel batchId={batchId} students={students} onStudentsChanged={() => loadStudents(batchId)} />}
           {activeTab === "audit" && isAdmin && <AuditLog log={auditLog} />}
           {activeTab === "batches" && isAdmin && <BatchesPanel batches={batches} onChanged={() => api("/api/batches").then((d) => setBatches(d.batches || []))} />}
           {activeTab === "payout" && isAdmin && <FacultyPayout batchId={batchId} />}
@@ -230,7 +367,7 @@ export default function DashboardPage() {
                 {navSections.map((key) => {
                   const meta = NAV_META[key]; const Icon = meta.icon;
                   return (
-                    <button key={key} onClick={() => setActiveTab(key)}
+                    <button key={key} onClick={() => openTab(key)}
                       style={{ display: "flex", alignItems: "center", gap: 6, padding: "10px 14px", fontSize: 13.5, background: "none", border: "none", cursor: "pointer", whiteSpace: "nowrap",
                         borderBottom: activeTab === key ? `2.5px solid ${THEME.green}` : "2.5px solid transparent",
                         color: activeTab === key ? THEME.navy : THEME.textMuted, fontWeight: activeTab === key ? 600 : 500 }}>
@@ -241,12 +378,12 @@ export default function DashboardPage() {
               </div>
 
               {activeTab === "home" && <Overview detail={detail} />}
-              {activeTab === "modules" && <Modules detail={detail} courseId={courseId!} onRefresh={refresh} />}
+              {activeTab === "modules" && <Modules detail={detail} courseId={courseId!} onRefresh={reloadDetail} />}
               {activeTab === "plan" && <WeeklyPlan detail={detail} courseId={courseId!} onRefresh={refresh} />}
               {activeTab === "assignments" && <Assignments detail={detail} courseId={courseId!} onRefresh={refresh} />}
               {activeTab === "tests" && <Tests detail={detail} courseId={courseId!} onRefresh={refresh} />}
-              {activeTab === "marks" && user.role !== "student" && <Marks detail={detail} students={students} courseId={courseId!} isAdmin={isAdmin} onRefresh={refresh} />}
-              {activeTab === "attendance" && user.role !== "student" && <Attendance detail={detail} students={students} courseId={courseId!} onRefresh={refresh} />}
+              {activeTab === "marks" && user.role !== "student" && <Marks detail={detail} students={students} courseId={courseId!} isAdmin={isAdmin} onRefresh={reloadDetail} />}
+              {activeTab === "attendance" && user.role !== "student" && <Attendance detail={detail} students={students} courseId={courseId!} onRefresh={reloadDetail} />}
             </>
           )}
         </div>
@@ -254,7 +391,7 @@ export default function DashboardPage() {
     </div>
   );
 }
-function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onLogout, onChangeBatch, activeTab, onOpenOrg, onOpenMonthly, onOpenWeeklySched, onOpenCredentials, onOpenAudit, onOpenBatches, onOpenPayout, onOpenFees, onOpenMyResults }: any) {
+function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onLogout, onChangeBatch, activeTab, onOpenOrg, onOpenMonthly, onOpenWeeklySched, onOpenCredentials, onOpenAudit, onOpenBatches, onOpenPayout, onOpenFees, onOpenMyResults, onOpenReports }: any) {
   const roleLabel: Record<string, string> = { admin: "Operations Head", faculty: "Faculty", student: "Student" };
   const GlobalBtn = ({ active, onClick, icon: Icon, label }: any) => (
     <button onClick={onClick} style={{ width: "100%", display: "flex", alignItems: "center", gap: 9, padding: "10px 12px", borderRadius: 8,
@@ -285,6 +422,7 @@ function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onL
 
       <div style={{ padding: "6px 12px", display: "flex", flexDirection: "column", gap: 3 }}>
         {user.role === "admin" && <GlobalBtn active={activeTab === "org"} onClick={onOpenOrg} icon={TrendingUp} label="Organization dashboard" />}
+        {user.role === "admin" && <GlobalBtn active={activeTab === "reports"} onClick={onOpenReports} icon={FileChartColumn} label="MIS reports" />}
         <GlobalBtn active={activeTab === "monthly"} onClick={onOpenMonthly} icon={CalendarRange} label="Monthly calendar" />
         <GlobalBtn active={activeTab === "weekly-sched"} onClick={onOpenWeeklySched} icon={CalendarClock} label="Weekly schedule" />
         {user.role === "admin" && <GlobalBtn active={activeTab === "payout"} onClick={onOpenPayout} icon={Wallet} label="Faculty payout" />}
@@ -301,7 +439,7 @@ function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onL
       <div style={{ flex: 1, overflowY: "auto", padding: "0 12px" }}>
         {visibleCourses.length === 0 && <div style={{ fontSize: 12, color: "#8FA0AE", padding: "8px 12px" }}>No courses in this batch yet.</div>}
         {visibleCourses.map((c: CourseSummary) => {
-          const active = c.id === activeCourseId && !["org","monthly","weekly-sched","credentials","audit","batches","payout","fees","myresults"].includes(activeTab);
+          const active = c.id === activeCourseId && !["org","monthly","weekly-sched","credentials","audit","batches","payout","fees","myresults","reports"].includes(activeTab);
           return (
             <button key={c.id} onClick={() => onSelectCourse(c.id)}
               style={{ width: "100%", textAlign: "left", padding: "10px 12px", marginBottom: 3, borderRadius: 8, border: "none", cursor: "pointer",
@@ -346,7 +484,7 @@ function StatCard({ icon: Icon, label, value, sub, accent }: any) {
   );
 }
 
-function OrgDashboard({ courses, batchId, onSelectCourse }: { courses: CourseSummary[]; batchId: string; onSelectCourse: (id: string) => void }) {
+function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { courses: CourseSummary[]; batchId: string; onSelectCourse: (id: string) => void; onOpenReports: () => void }) {
   const [stats, setStats] = useState<any>(null);
   const [progress, setProgress] = useState<Record<string, number>>({});
   const [attendanceByCourse, setAttendanceByCourse] = useState<any[]>([]);
@@ -400,9 +538,14 @@ function OrgDashboard({ courses, batchId, onSelectCourse }: { courses: CourseSum
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Organization dashboard</div>
-        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Live progress across all {courses.length} courses</div>
+      <div style={{ marginBottom: 24, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Organization dashboard</div>
+          <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Live progress across all {courses.length} courses</div>
+        </div>
+        <button onClick={onOpenReports} style={{ display: "flex", alignItems: "center", gap: 7, padding: "9px 16px", borderRadius: 8, border: "none", background: THEME.navy, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+          <FileChartColumn size={15} /> Download MIS report
+        </button>
       </div>
       {stats && (
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 28 }}>
@@ -505,8 +648,18 @@ function CombinedAttendanceTable({ batchId }: { batchId: string }) {
   );
 }
 
-function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCourse }: any) {
+function WeeklyCalendar({ courses, user, onSaved, onSelectCourse }: any) {
   const canEditCourse = (c: CourseSummary) => user.role === "admin" || (user.role === "faculty" && user.courseId === c.id);
+  const draft = useDraft("weekly-schedule", onSaved);
+  // Day and parity are saved together in one request per course.
+  const schedOf = (c: CourseSummary) => draft.get(`sched:${c.id}`, { day: c.day_allocated, parity: c.day_parity });
+  const stageSched = (c: CourseSummary, next: { day: string; parity: string | null }) => {
+    const unchanged = next.day === c.day_allocated && (next.parity || null) === (c.day_parity || null);
+    draft.stage(`sched:${c.id}`, next,
+      (v) => api(`/api/courses/${c.id}`, { method: "PATCH", body: JSON.stringify({ dayAllocated: v.day, dayParity: v.parity }) }),
+      unchanged ? next : undefined);
+  };
+  const shown: CourseSummary[] = courses.map((c: CourseSummary) => { const sch = schedOf(c); return { ...c, day_allocated: sch.day, day_parity: sch.parity }; });
   return (
     <div>
       <div style={{ marginBottom: 24 }}>
@@ -516,7 +669,7 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
       <div style={{ overflowX: "auto" }}>
         <div style={{ display: "grid", gridTemplateColumns: `repeat(${DAYS_ORDER.length}, 1fr)`, gap: 10, minWidth: 760 }}>
           {DAYS_ORDER.map((day) => {
-            const dayCourses = courses.filter((c: CourseSummary) => c.day_allocated === day);
+            const dayCourses = shown.filter((c: CourseSummary) => c.day_allocated === day);
             return (
               <div key={day} style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase",
@@ -525,7 +678,7 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10, minHeight: 60 }}>
                   {dayCourses.length === 0 && <div style={{ fontSize: 11, color: THEME.textFaint, textAlign: "center", padding: "10px 4px" }}>—</div>}
                   {dayCourses.map((c: CourseSummary) => (
-                    <div key={c.id} style={{ padding: "10px 10px", borderRadius: 10, border: `1px solid ${THEME.border}`, background: THEME.card }}>
+                    <div key={c.id} style={{ padding: "10px 10px", borderRadius: 10, border: `1px solid ${draft.has(`sched:${c.id}`) ? THEME.orange : THEME.border}`, background: draft.has(`sched:${c.id}`) ? "#FFFBF4" : THEME.card }}>
                       <button onClick={() => onSelectCourse(c.id)} style={{ background: "none", border: "none", padding: 0, textAlign: "left", cursor: "pointer", width: "100%" }}>
                         <div style={{ fontSize: 12, fontWeight: 600, color: THEME.navy, lineHeight: 1.3 }}>{c.name}</div>
                         <div style={{ fontSize: 10.5, color: THEME.textMuted, marginTop: 3 }}>{c.faculty_name.replace(/^(Mr\.|Ms\.)\s*/, "")}</div>
@@ -535,11 +688,11 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
                       </button>
                       {canEditCourse(c) && (
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
-                          <select value={c.day_allocated} onChange={(e) => onChangeDay(c.id, e.target.value)} onClick={(e) => e.stopPropagation()}
+                          <select value={c.day_allocated} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: e.target.value, parity: c.day_parity })} onClick={(e) => e.stopPropagation()}
                             style={{ width: "100%", padding: "5px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 10.5, background: THEME.bg, color: THEME.textMuted }}>
                             {DAYS_ORDER.map((d) => <option key={d} value={d}>{d}</option>)}
                           </select>
-                          <select value={c.day_parity || "every"} onChange={(e) => onChangeParity(c.id, e.target.value === "every" ? null : e.target.value)} onClick={(e) => e.stopPropagation()}
+                          <select value={c.day_parity || "every"} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: c.day_allocated, parity: e.target.value === "every" ? null : e.target.value })} onClick={(e) => e.stopPropagation()}
                             style={{ width: "100%", padding: "5px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 10.5, background: THEME.bg, color: THEME.textMuted }}>
                             <option value="every">Every week</option>
                             <option value="odd">Odd weeks only</option>
@@ -555,6 +708,7 @@ function WeeklyCalendar({ courses, user, onChangeDay, onChangeParity, onSelectCo
           })}
         </div>
       </div>
+      {courses.some((c: CourseSummary) => canEditCourse(c)) && <SaveBar draft={draft} />}
     </div>
   );
 }
@@ -569,14 +723,18 @@ function EventAttendancePanel({ eventId, students }: { eventId: string; students
   }, [eventId]);
   useEffect(() => { load(); }, [load]);
 
-  const toggle = async (studentRosterId: string, current: boolean) => {
-    setRecords((r) => ({ ...r, [studentRosterId]: !current }));
-    await api(`/api/calendar-events/${eventId}/attendance`, { method: "POST", body: JSON.stringify({ studentRosterId, present: !current }) });
+  const draft = useDraft(`event-attendance-${eventId}`, load);
+  const isPresent = (sid: string) => draft.get(`ev:${sid}`, !!records[sid]);
+  const toggle = (studentRosterId: string) => {
+    const next = !isPresent(studentRosterId);
+    draft.stage(`ev:${studentRosterId}`, next,
+      (present) => api(`/api/calendar-events/${eventId}/attendance`, { method: "POST", body: JSON.stringify({ studentRosterId, present }) }),
+      !!records[studentRosterId]);
   };
 
   if (loading) return <div style={{ padding: "10px 16px", fontSize: 12, color: THEME.textFaint }}>Loading attendance...</div>;
 
-  const presentCount = Object.values(records).filter(Boolean).length;
+  const presentCount = students.filter((s) => isPresent(s.id)).length;
 
   return (
     <div style={{ padding: "12px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.bg }}>
@@ -585,16 +743,17 @@ function EventAttendancePanel({ eventId, students }: { eventId: string; students
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 6, maxHeight: 220, overflowY: "auto" }}>
         {students.map((s) => {
-          const present = !!records[s.id];
+          const present = isPresent(s.id);
           const displayName = s.name?.trim() ? s.name : s.label;
           return (
-            <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, padding: "4px 6px", borderRadius: 6, background: present ? THEME.greenLight : THEME.card, cursor: "pointer" }}>
-              <input type="checkbox" checked={present} onChange={() => toggle(s.id, present)} style={{ width: 14, height: 14 }} />
+            <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, padding: "4px 6px", borderRadius: 6, background: present ? THEME.greenLight : THEME.card, cursor: "pointer", outline: draft.has(`ev:${s.id}`) ? `1.5px solid ${THEME.orange}` : "none" }}>
+              <input type="checkbox" checked={present} onChange={() => toggle(s.id)} style={{ width: 14, height: 14 }} />
               <span style={{ color: present ? THEME.greenDark : THEME.textMuted, fontWeight: present ? 600 : 400 }}>{displayName}</span>
             </label>
           );
         })}
       </div>
+      <SaveBar draft={draft} compact />
     </div>
   );
 }
@@ -747,7 +906,7 @@ function MonthlyCalendar({ courses, isAdmin, batchId, students, onChanged }: { c
                     </div>
                     <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
                       {isAdmin && (
-                        <button onClick={() => setExpandedEventId(expanded ? null : e.id)} style={{ fontSize: 11.5, background: "none", border: "none", color: THEME.greenDark, cursor: "pointer", fontWeight: 600 }}>
+                        <button onClick={() => { if (confirmLeave()) setExpandedEventId(expanded ? null : e.id); }} style={{ fontSize: 11.5, background: "none", border: "none", color: THEME.greenDark, cursor: "pointer", fontWeight: 600 }}>
                           {expanded ? "Hide attendance" : "Take attendance"}
                         </button>
                       )}
@@ -767,7 +926,9 @@ function MonthlyCalendar({ courses, isAdmin, batchId, students, onChanged }: { c
 
 function BatchesPanel({ batches, onChanged }: { batches: Batch[]; onChanged: () => void }) {
   const [newName, setNewName] = useState("");
-  const rename = async (id: string, name: string) => { await api(`/api/batches/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }); onChanged(); };
+  const draft = useDraft("batches", onChanged);
+  const stageRename = (b: Batch, name: string) =>
+    draft.stage(`batch:${b.id}`, name, (v) => api(`/api/batches/${b.id}`, { method: "PATCH", body: JSON.stringify({ name: v }) }), b.name);
   const addBatch = async () => { if (!newName.trim()) return; await api("/api/batches", { method: "POST", body: JSON.stringify({ name: newName.trim() }) }); setNewName(""); onChanged(); };
 
   return (
@@ -776,14 +937,16 @@ function BatchesPanel({ batches, onChanged }: { batches: Batch[]; onChanged: () 
         <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Batches</div>
         <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Rename existing batches or add a new one.</div>
       </div>
-      <div style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, overflow: "hidden", marginBottom: 20 }}>
+      <div key={draft.version} style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, overflow: "hidden", marginBottom: 4 }}>
         {batches.map((b, i) => (
           <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 16px", borderBottom: i < batches.length - 1 ? `1px solid ${THEME.border}` : "none" }}>
             <Layers size={16} color={THEME.textFaint} />
-            <input defaultValue={b.name} onBlur={(e) => rename(b.id, e.target.value)} style={{ flex: 1, padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 14 }} />
+            <input defaultValue={draft.get(`batch:${b.id}`, b.name)} onChange={(e) => stageRename(b, e.target.value)} style={{ flex: 1, padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 14, ...dirtyStyle(draft.has(`batch:${b.id}`)) }} />
           </div>
         ))}
       </div>
+      <SaveBar draft={draft} />
+      <div style={{ height: 20 }} />
       <div style={{ display: "flex", gap: 8 }}>
         <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="New batch name" style={{ flex: 1, padding: "9px 12px", borderRadius: 8, border: `1px solid ${THEME.border}`, fontSize: 13.5 }} />
         <button onClick={addBatch} style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 8, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}><Plus size={14} /> Add batch</button>
@@ -792,68 +955,206 @@ function BatchesPanel({ batches, onChanged }: { batches: Batch[]; onChanged: () 
   );
 }
 
-function CredentialsPanel({ students, onStudentsChanged }: { students: StudentRow[]; onStudentsChanged: () => void }) {
+function CredentialsPanel({ batchId, students, onStudentsChanged }: { batchId: string; students: StudentRow[]; onStudentsChanged: () => Promise<unknown> | void }) {
   const [creds, setCreds] = useState<any>(null);
-  useEffect(() => { api("/api/admin/credentials").then(setCreds); }, []);
+  const [toDelete, setToDelete] = useState<StudentRow[] | null>(null);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [showAdd, setShowAdd] = useState(false);
+  const selectedStudents = students.filter((s) => selected[s.id]);
+  const allSelected = students.length > 0 && selectedStudents.length === students.length;
+  const loadCreds = useCallback(() => api("/api/admin/credentials").then(setCreds), []);
+  useEffect(() => { loadCreds(); }, [loadCreds]);
+  const draft = useDraft("credentials", async () => { await Promise.all([loadCreds(), onStudentsChanged()]); });
   const inputStyle = { padding: "6px 9px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 12.5 };
   if (!creds) return <div style={{ color: THEME.textMuted, fontSize: 13 }}>Loading credentials...</div>;
 
+  const patchUser = (userId: string, body: object) => api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId, ...body }) });
+  const patchStudent = (id: string, body: object) => api(`/api/students/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  // A text field bound to the draft: shows the staged value, highlights when changed.
+  const Field = ({ k, original, commit, width, placeholder, type = "text" }: { k: string; original: string; commit: (v: any) => Promise<unknown>; width: number; placeholder?: string; type?: string }) => (
+    <input type={type} defaultValue={draft.get(k, original)} placeholder={placeholder}
+      onChange={(e) => draft.stage(k, type === "number" ? Number(e.target.value) : e.target.value, commit, type === "number" ? Number(original) : original)}
+      style={{ ...inputStyle, width, ...dirtyStyle(draft.has(k)) }} />
+  );
+
   return (
-    <div>
+    <div key={draft.version}>
       <div style={{ marginBottom: 24 }}>
         <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Credentials</div>
-        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Only visible to you. Manage every login, student name, and pay rate from here.</div>
+        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Only visible to you. Manage every login, student name, and pay rate from here. Changes apply when you click Save.</div>
       </div>
 
       <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
         <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 10 }}>Your admin login</div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <span style={{ fontSize: 12.5, color: THEME.textMuted }}>Username: <strong>{creds.admin?.username}</strong></span>
-          <input placeholder="New password" onBlur={(e) => { if (e.target.value) api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId: creds.admin.id, password: e.target.value }) }); }} style={inputStyle} />
+          {Field({ k: "admin:password", original: "", width: 160, placeholder: "New password", commit: (v) => (v ? patchUser(creds.admin.id, { password: v }) : Promise.resolve()) })}
         </div>
       </div>
 
       <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
         <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 12 }}>Faculty logins & pay rates</div>
-        {creds.faculty.map((f: any) => <FacultyRow key={f.id} f={f} inputStyle={inputStyle} />)}
+        {creds.faculty.map((f: any) => (
+          <div key={`${f.id}-${f.course_id}`} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "8px 0", borderBottom: `1px solid ${THEME.border}` }}>
+            <div style={{ fontSize: 12.5, minWidth: 150 }}>{f.name}</div>
+            {Field({ k: `fac:${f.id}:username`, original: f.username, width: 130, placeholder: "Username", commit: (v) => patchUser(f.id, { username: v }) })}
+            {Field({ k: `fac:${f.id}:password`, original: "", width: 110, placeholder: "New password", commit: (v) => (v ? patchUser(f.id, { password: v }) : Promise.resolve()) })}
+            <span style={{ fontSize: 11.5, color: THEME.textMuted }}>Pay rate ₹/hr:</span>
+            {Field({ k: `fac:${f.id}:payRate`, original: String(f.pay_rate ?? 800), width: 70, type: "number", commit: (v) => patchUser(f.id, { payRate: v }) })}
+          </div>
+        ))}
       </div>
 
       <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
-        <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 4 }}>Student logins</div>
-        <div style={{ fontSize: 12, color: THEME.textMuted, marginBottom: 12 }}>Each student has their own username and password.</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 4 }}>Student logins <span style={{ fontWeight: 500, color: THEME.textMuted }}>· {students.length} student{students.length === 1 ? "" : "s"} in this batch</span></div>
+            <div style={{ fontSize: 12, color: THEME.textMuted }}>Each student has their own username and password. Deleting a student removes them and all their data from the portal.</div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {selectedStudents.length > 0 && (
+              <button onClick={() => setToDelete(selectedStudents)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 8, border: "1px solid #F1C9C9", background: "#FFF5F5", color: "#A32D2D", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                <Trash2 size={14} /> Delete selected ({selectedStudents.length})
+              </button>
+            )}
+            <button onClick={() => setShowAdd((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 8, border: "none", background: THEME.green, color: "white", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+              <Plus size={14} /> Add student
+            </button>
+          </div>
+        </div>
+        {showAdd && <AddStudentForm batchId={batchId} onCancel={() => setShowAdd(false)} onAdded={async () => { await onStudentsChanged(); }} />}
         <div style={{ maxHeight: 420, overflowY: "auto", overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 640 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 700 }}>
             <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, textAlign: "left" }}>
-              <th style={{ padding: "6px 8px" }}>Seat</th><th style={{ padding: "6px 8px" }}>Name</th><th style={{ padding: "6px 8px" }}>Username</th><th style={{ padding: "6px 8px" }}>New password</th>
+              <th style={{ padding: "6px 8px", width: 28 }}><input type="checkbox" title="Select all" checked={allSelected} onChange={() => setSelected(allSelected ? {} : Object.fromEntries(students.map((s) => [s.id, true])))} /></th><th style={{ padding: "6px 8px" }}>Seat</th><th style={{ padding: "6px 8px" }}>Name</th><th style={{ padding: "6px 8px" }}>Username</th><th style={{ padding: "6px 8px" }}>New password</th><th style={{ padding: "6px 8px", textAlign: "center" }}>Delete</th>
             </tr></thead>
             <tbody>
               {students.map((s) => (
-                <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
+                <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}`, background: selected[s.id] ? "#FFF8F8" : undefined }}>
+                  <td style={{ padding: "5px 8px" }}><input type="checkbox" checked={!!selected[s.id]} onChange={() => setSelected((sel) => ({ ...sel, [s.id]: !sel[s.id] }))} /></td>
                   <td style={{ padding: "5px 8px", color: THEME.textFaint }}>{s.label}</td>
-                  <td style={{ padding: "5px 8px" }}><input defaultValue={s.name} placeholder="Enter name" onBlur={(e) => api(`/api/students/${s.id}`, { method: "PATCH", body: JSON.stringify({ name: e.target.value }) }).then(onStudentsChanged)} style={{ ...inputStyle, width: 140 }} /></td>
-                  <td style={{ padding: "5px 8px" }}><input defaultValue={s.username} onBlur={(e) => api(`/api/students/${s.id}`, { method: "PATCH", body: JSON.stringify({ username: e.target.value }) }).then(onStudentsChanged)} style={{ ...inputStyle, width: 100 }} /></td>
-                  <td style={{ padding: "5px 8px" }}><input placeholder="New password" onBlur={(e) => { if (e.target.value) api(`/api/students/${s.id}`, { method: "PATCH", body: JSON.stringify({ password: e.target.value }) }); }} style={{ ...inputStyle, width: 100 }} /></td>
+                  <td style={{ padding: "5px 8px" }}>{Field({ k: `stu:${s.id}:name`, original: s.name || "", width: 140, placeholder: "Enter name", commit: (v) => patchStudent(s.id, { name: v }) })}</td>
+                  <td style={{ padding: "5px 8px" }}>{Field({ k: `stu:${s.id}:username`, original: s.username || "", width: 110, commit: (v) => patchStudent(s.id, { username: v }) })}</td>
+                  <td style={{ padding: "5px 8px" }}>{Field({ k: `stu:${s.id}:password`, original: "", width: 110, placeholder: "New password", commit: (v) => (v ? patchStudent(s.id, { password: v }) : Promise.resolve()) })}</td>
+                  <td style={{ padding: "5px 8px", textAlign: "center" }}>
+                    <button onClick={() => setToDelete([s])} title={`Delete ${s.name?.trim() || s.label}`}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 6, border: "1px solid #F1C9C9", background: "#FFF5F5", color: "#A32D2D", fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+                      <Trash2 size={13} /> Delete
+                    </button>
+                  </td>
                 </tr>
               ))}
+              {students.length === 0 && <tr><td colSpan={6} style={{ padding: 16, textAlign: "center", color: THEME.textFaint }}>No students in this batch yet. Click “Add student” to add one.</td></tr>}
             </tbody>
           </table>
         </div>
       </div>
+
+      <SaveBar draft={draft} />
+
+      {toDelete && (
+        <DeleteStudentDialog students={toDelete} onClose={() => setToDelete(null)}
+          onDeleted={async (ids) => {
+            draft.drop((k) => ids.some((id) => k.startsWith(`stu:${id}:`)));
+            setSelected((sel) => Object.fromEntries(Object.entries(sel).filter(([id]) => !ids.includes(id))));
+            await onStudentsChanged();
+          }} />
+      )}
     </div>
   );
 }
 
-function FacultyRow({ f, inputStyle }: any) {
-  const [username, setUsername] = useState(f.username);
-  const [password, setPassword] = useState("");
-  const [payRate, setPayRate] = useState(f.pay_rate ?? 800);
+function AddStudentForm({ batchId, onCancel, onAdded }: { batchId: string; onCancel: () => void; onAdded: () => Promise<unknown> }) {
+  const blank = { name: "", username: "", password: "", feeCategory: "General" };
+  const [form, setForm] = useState(blank);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [lastAdded, setLastAdded] = useState("");
+  const field = { padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13 };
+
+  const submit = async () => {
+    setBusy(true); setError("");
+    try {
+      const d = await api("/api/students", { method: "POST", body: JSON.stringify({ batchId, ...form }) });
+      setLastAdded(`${d.student.name} added as ${d.student.label} (username: ${d.student.username}).`);
+      setForm(blank);
+      await onAdded();
+    } catch (e: any) { setError(e.message || "Could not add the student."); }
+    finally { setBusy(false); }
+  };
+
   return (
-    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "8px 0", borderBottom: `1px solid ${THEME.border}` }}>
-      <div style={{ fontSize: 12.5, minWidth: 150 }}>{f.name}</div>
-      <input value={username} onChange={(e) => setUsername(e.target.value)} onBlur={() => api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId: f.id, username }) })} style={{ ...inputStyle, width: 130 }} placeholder="Username" />
-      <input value={password} onChange={(e) => setPassword(e.target.value)} onBlur={() => { if (password) api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId: f.id, password }) }); }} style={{ ...inputStyle, width: 110 }} placeholder="New password" />
-      <span style={{ fontSize: 11.5, color: THEME.textMuted }}>Pay rate ₹/hr:</span>
-      <input type="number" value={payRate} onChange={(e) => setPayRate(Number(e.target.value))} onBlur={() => api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId: f.id, payRate }) })} style={{ ...inputStyle, width: 70 }} />
+    <div style={{ marginBottom: 14, padding: 14, borderRadius: 10, border: `1px solid ${THEME.green}`, background: "#F8FCF2" }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: THEME.navy, marginBottom: 10 }}>Add a new student to this batch</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Full name</label><br /><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Priya Sharma" style={{ ...field, width: 180 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Username</label><br /><input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value.replace(/\s/g, "") })} placeholder="e.g. priya.sharma" style={{ ...field, width: 140 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Password</label><br /><input value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="At least 4 characters" style={{ ...field, width: 150 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Fee category</label><br />
+          <select value={form.feeCategory} onChange={(e) => setForm({ ...form, feeCategory: e.target.value })} style={field}><option value="General">General</option><option value="Reserved">Reserved</option></select>
+        </div>
+        <button onClick={submit} disabled={busy} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 700, cursor: busy ? "default" : "pointer", opacity: busy ? 0.7 : 1 }}>{busy ? "Adding…" : "Add student"}</button>
+        <button onClick={onCancel} style={{ padding: "9px 14px", borderRadius: 7, border: `1px solid ${THEME.border}`, background: THEME.card, fontSize: 13, cursor: "pointer" }}>Close</button>
+      </div>
+      {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#A32D2D" }}>{error}</div>}
+      {lastAdded && !error && <div style={{ marginTop: 10, fontSize: 12.5, color: THEME.greenDark, fontWeight: 600 }}>✓ {lastAdded} You can add another.</div>}
+    </div>
+  );
+}
+
+function DeleteStudentDialog({ students, onClose, onDeleted }: { students: StudentRow[]; onClose: () => void; onDeleted: (ids: string[]) => Promise<unknown> | void }) {
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState("");
+  const nameOf = (s: StudentRow) => (s.name?.trim() ? `${s.name} (${s.label})` : s.label);
+  const single = students.length === 1;
+  const confirmed = typed.trim().toUpperCase() === "DELETE";
+
+  const doDelete = async () => {
+    if (!confirmed || busy) return;
+    setBusy(true); setError("");
+    const deleted: string[] = [];
+    const failed: string[] = [];
+    for (const s of students) {
+      try { await api(`/api/students/${s.id}`, { method: "DELETE" }); deleted.push(s.id); }
+      catch { failed.push(nameOf(s)); }
+      setProgress(deleted.length + failed.length);
+    }
+    await onDeleted(deleted);
+    if (failed.length) { setError(`Could not delete: ${failed.join(", ")}. Please try again.`); setBusy(false); }
+    else onClose();
+  };
+
+  return (
+    <div onClick={busy ? undefined : onClose} style={{ position: "fixed", inset: 0, background: "rgba(11,29,46,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: THEME.card, borderRadius: 14, padding: 22, boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 10, background: "#FCEBEB", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><TriangleAlert size={18} color="#A32D2D" /></div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: THEME.navy }}>{single ? `Delete ${nameOf(students[0])}?` : `Delete ${students.length} students?`}</div>
+        </div>
+        {!single && (
+          <div style={{ maxHeight: 120, overflowY: "auto", fontSize: 12, color: THEME.textMuted, background: THEME.bg, borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+            {students.map(nameOf).join(", ")}
+          </div>
+        )}
+        <div style={{ fontSize: 13, color: THEME.navy, lineHeight: 1.55 }}>
+          This permanently removes {single ? "the student" : "these students"} from the portal, including:
+          <div style={{ margin: "8px 0 10px", color: THEME.textMuted }}>login, attendance in every subject and guest event, all marks (formative and summative), and fee payment records.</div>
+          <strong>This cannot be undone.</strong> Type <strong>DELETE</strong> to confirm.
+        </div>
+        <input autoFocus value={typed} onChange={(e) => setTyped(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") doDelete(); }} placeholder="Type DELETE" disabled={busy}
+          style={{ width: "100%", boxSizing: "border-box", marginTop: 12, padding: "9px 12px", borderRadius: 8, border: `1px solid ${THEME.border}`, fontSize: 13.5 }} />
+        {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#A32D2D" }}>{error}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <button onClick={onClose} disabled={busy} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${THEME.border}`, background: THEME.card, fontSize: 13, cursor: "pointer" }}>Cancel</button>
+          <button onClick={doDelete} disabled={!confirmed || busy}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700,
+              background: confirmed ? "#C23B3B" : "#E8C4C4", color: "white", cursor: confirmed && !busy ? "pointer" : "default" }}>
+            <Trash2 size={14} /> {busy ? `Deleting ${progress} of ${students.length}…` : single ? "Delete student" : `Delete ${students.length} students`}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -927,30 +1228,35 @@ function Overview({ detail }: { detail: CourseDetail }) {
   );
 }
 
-function Modules({ detail, courseId, onRefresh }: { detail: CourseDetail; courseId: string; onRefresh: () => void }) {
+function Modules({ detail, courseId, onRefresh }: { detail: CourseDetail; courseId: string; onRefresh: () => unknown }) {
   const canEdit = detail.canEdit;
-  async function patch(moduleId: string, patch: any) { await api(`/api/courses/${courseId}/modules`, { method: "PATCH", body: JSON.stringify({ moduleId, ...patch }) }); onRefresh(); }
+  const draft = useDraft(`modules-${courseId}`, onRefresh);
+  const patch = (moduleId: string, body: any) => api(`/api/courses/${courseId}/modules`, { method: "PATCH", body: JSON.stringify({ moduleId, ...body }) });
   return (
+    <div key={draft.version}>
     <div style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, overflow: "hidden" }}>
       {detail.modules.map((m) => {
-        const s = STATUS_STYLES[m.status];
+        const status = draft.get(`mod:${m.id}:status`, m.status);
+        const s = STATUS_STYLES[status];
         return (
           <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderBottom: `1px solid ${THEME.border}` }}>
             <div style={{ width: 26, height: 26, borderRadius: 7, background: THEME.bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: THEME.textMuted, flexShrink: 0 }}>{m.module_number}</div>
             <div style={{ flex: 1 }}>
               {canEdit ? (
-                <input defaultValue={m.module_name || ""} placeholder="Enter module name" onBlur={(e) => { if (e.target.value !== (m.module_name || "")) patch(m.id, { moduleName: e.target.value }); }} style={{ width: "100%", padding: "7px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 14, boxSizing: "border-box" }} />
+                <input defaultValue={draft.get(`mod:${m.id}:name`, m.module_name || "")} placeholder="Enter module name" onChange={(e) => draft.stage(`mod:${m.id}:name`, e.target.value, (v) => patch(m.id, { moduleName: v }), m.module_name || "")} style={{ width: "100%", padding: "7px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 14, boxSizing: "border-box", ...dirtyStyle(draft.has(`mod:${m.id}:name`)) }} />
               ) : (<div style={{ fontSize: 14 }}>{m.module_name || <span style={{ color: THEME.textFaint }}>Module name not yet added</span>}</div>)}
               {m.status === "completed" && m.completed_date && <div style={{ fontSize: 11, color: THEME.textFaint, marginTop: 3 }}>Completed {new Date(m.completed_date).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</div>}
             </div>
             {canEdit ? (
-              <select value={m.status} onChange={(e) => patch(m.id, { status: e.target.value })} style={{ padding: "7px 10px", borderRadius: 7, border: "none", fontSize: 12.5, fontWeight: 600, background: s.bg, color: s.text }}>
+              <select value={status} onChange={(e) => draft.stage(`mod:${m.id}:status`, e.target.value, (v) => patch(m.id, { status: v }), m.status)} style={{ padding: "7px 10px", borderRadius: 7, border: draft.has(`mod:${m.id}:status`) ? `1.5px solid ${THEME.orange}` : "1.5px solid transparent", fontSize: 12.5, fontWeight: 600, background: s.bg, color: s.text }}>
                 <option value="not_started">Not started</option><option value="in_progress">In progress</option><option value="completed">Completed</option>
               </select>
             ) : (<span style={{ padding: "5px 12px", borderRadius: 20, fontSize: 12, fontWeight: 600, background: s.bg, color: s.text }}>{s.label}</span>)}
           </div>
         );
       })}
+    </div>
+    {canEdit && <SaveBar draft={draft} />}
     </div>
   );
 }
@@ -1123,13 +1429,33 @@ function Tests({ detail, courseId, onRefresh }: { detail: CourseDetail; courseId
   );
 }
 
-function Marks({ detail, students, courseId, isAdmin, onRefresh }: { detail: CourseDetail; students: StudentRow[]; courseId: string; isAdmin: boolean; onRefresh: () => void }) {
-  const canEdit = detail.canEdit;
-  const setScore = async (studentRosterId: string, componentId: string, value: string) => { if (value === "") return; await api(`/api/courses/${courseId}/scores`, { method: "POST", body: JSON.stringify({ studentRosterId, componentId, marks: Number(value) }) }); onRefresh(); };
-  const setSummative = async (studentRosterId: string, value: string) => { if (value === "") return; await api(`/api/courses/${courseId}/summative`, { method: "POST", body: JSON.stringify({ studentRosterId, marks: Number(value) }) }); onRefresh(); };
+function Marks({ detail: savedDetail, students, courseId, isAdmin, onRefresh }: { detail: CourseDetail; students: StudentRow[]; courseId: string; isAdmin: boolean; onRefresh: () => unknown }) {
+  const canEdit = savedDetail.canEdit;
+  const draft = useDraft(`marks-${courseId}`, onRefresh);
+  const scoreKey = (sid: string, cid: string) => `score:${sid}:${cid}`;
+  const sumKey = (sid: string) => `sum:${sid}`;
+  const setScore = (studentRosterId: string, componentId: string, value: string) => {
+    const original = savedDetail.scores[studentRosterId]?.[componentId] ?? "";
+    // A cleared box is treated as "no change" (marks are never deleted from here).
+    const v = value === "" ? original : value;
+    draft.stage(scoreKey(studentRosterId, componentId), v, (marks) => api(`/api/courses/${courseId}/scores`, { method: "POST", body: JSON.stringify({ studentRosterId, componentId, marks: Number(marks) }) }), original);
+  };
+  const setSummative = (studentRosterId: string, value: string) => {
+    const original = savedDetail.summativeMarks[studentRosterId] ?? "";
+    const v = value === "" ? original : value;
+    draft.stage(sumKey(studentRosterId), v, (marks) => api(`/api/courses/${courseId}/summative`, { method: "POST", body: JSON.stringify({ studentRosterId, marks: Number(marks) }) }), original);
+  };
+  // Show totals with unsaved marks included, so the table reflects what will be saved.
+  const detail: CourseDetail = {
+    ...savedDetail,
+    scores: Object.fromEntries(students.map((s) => [s.id, Object.fromEntries(savedDetail.components.map((c) => [c.id, draft.get(scoreKey(s.id, c.id), savedDetail.scores[s.id]?.[c.id])]).filter(([, v]) => v !== undefined && v !== ""))])),
+    summativeMarks: Object.fromEntries(students.map((s) => [s.id, draft.get(sumKey(s.id), savedDetail.summativeMarks[s.id])]).filter(([, v]) => v !== undefined && v !== "")),
+  };
   const togglePublish = async () => { await api(`/api/courses/${courseId}`, { method: "PATCH", body: JSON.stringify({ resultsPublished: !detail.course.results_published }) }); onRefresh(); };
 
   const downloadExcel = () => {
+    if (draft.count && !window.confirm("You have unsaved marks. The Excel file will include only saved marks. Continue?")) return;
+    const detail = savedDetail;
     const rows = students.map((s) => {
       const displayName = s.name?.trim() ? s.name : s.label;
       const row: Record<string, any> = { Student: displayName };
@@ -1168,7 +1494,7 @@ function Marks({ detail, students, courseId, isAdmin, onRefresh }: { detail: Cou
           </button>
         </div>
       )}
-      <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
+      <div key={draft.version} style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 760 }}>
           <thead>
             <tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg }}>
@@ -1198,13 +1524,13 @@ function Marks({ detail, students, courseId, isAdmin, onRefresh }: { detail: Cou
                     }
                     return (
                       <td key={c.id} style={{ padding: "7px 8px", textAlign: "center" }}>
-                        {canEdit ? (<input type="number" min={0} max={c.max_marks} defaultValue={row[c.id] ?? ""} onBlur={(e) => setScore(s.id, c.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} />) : (row[c.id] ?? "-")}
+                        {canEdit ? (<input type="number" min={0} max={c.max_marks} defaultValue={row[c.id] ?? ""} onChange={(e) => setScore(s.id, c.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(scoreKey(s.id, c.id))) }} />) : (row[c.id] ?? "-")}
                       </td>
                     );
                   })}
                   <td style={{ padding: "7px 8px", textAlign: "center", fontWeight: 700, color: THEME.greenDark, background: "#F7FBF1" }}>{formativeTotal}</td>
                   <td style={{ padding: "7px 8px", textAlign: "center", background: "#FAF8FD" }}>
-                    {canEdit ? (<input type="number" min={0} max={50} defaultValue={summative} onBlur={(e) => setSummative(s.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} />) : (summative === "" ? "-" : summative)}
+                    {canEdit ? (<input type="number" min={0} max={50} defaultValue={summative} onChange={(e) => setSummative(s.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(sumKey(s.id))) }} />) : (summative === "" ? "-" : summative)}
                   </td>
                   <td style={{ padding: "7px 12px", textAlign: "center", fontWeight: 700, color: THEME.navy }}>{grand}</td>
                 </tr>
@@ -1214,16 +1540,34 @@ function Marks({ detail, students, courseId, isAdmin, onRefresh }: { detail: Cou
         </table>
       </div>
       <div style={{ fontSize: 12, color: THEME.textFaint }}>The Attendance component fills in automatically from the Attendance tab.</div>
+      {canEdit && <SaveBar draft={draft} />}
     </div>
   );
 }
 
-function Attendance({ detail, students, courseId, onRefresh }: { detail: CourseDetail; students: StudentRow[]; courseId: string; onRefresh: () => void }) {
-  const [newDate, setNewDate] = useState(""); const [newTopic, setNewTopic] = useState(""); const [newDuration, setNewDuration] = useState(2);
+function Attendance({ detail, students, courseId, onRefresh }: { detail: CourseDetail; students: StudentRow[]; courseId: string; onRefresh: () => unknown }) {
+  const [newDate, setNewDate] = useState("");
   const canEdit = detail.canEdit;
-  const addSession = async () => { if (!newDate) return; await api(`/api/courses/${courseId}/attendance/sessions`, { method: "POST", body: JSON.stringify({ sessionDate: newDate }) }); setNewDate(""); setNewTopic(""); setNewDuration(2); onRefresh(); };
-  const removeSession = async (id: string) => { await api(`/api/courses/${courseId}/attendance/sessions?id=${id}`, { method: "DELETE" }); onRefresh(); };
-  const toggle = async (studentRosterId: string, sessionId: string, present: boolean) => { await api(`/api/courses/${courseId}/attendance/records`, { method: "POST", body: JSON.stringify({ sessionId, studentRosterId, present: !present }) }); onRefresh(); };
+  const draft = useDraft(`attendance-${courseId}`, onRefresh);
+  const attKey = (sid: string, sessId: string) => `att:${sid}:${sessId}`;
+  const isPresent = (sid: string, sessId: string) => draft.get(attKey(sid, sessId), !!detail.attendanceRecords[sid]?.[sessId]);
+  const addSession = async () => { if (!newDate) return; await api(`/api/courses/${courseId}/attendance/sessions`, { method: "POST", body: JSON.stringify({ sessionDate: newDate }) }); setNewDate(""); await onRefresh(); };
+  const removeSession = async (id: string) => {
+    if (!window.confirm("Remove this lecture session and its attendance marks?")) return;
+    await api(`/api/courses/${courseId}/attendance/sessions?id=${id}`, { method: "DELETE" });
+    draft.drop((k) => k.endsWith(`:${id}`));
+    await onRefresh();
+  };
+  const toggle = (studentRosterId: string, sessionId: string) => {
+    const next = !isPresent(studentRosterId, sessionId);
+    draft.stage(attKey(studentRosterId, sessionId), next,
+      (present) => api(`/api/courses/${courseId}/attendance/records`, { method: "POST", body: JSON.stringify({ sessionId, studentRosterId, present }) }),
+      !!detail.attendanceRecords[studentRosterId]?.[sessionId]);
+  };
+  const markAll = (sessionId: string, present: boolean) => students.forEach((s) =>
+    draft.stage(attKey(s.id, sessionId), present,
+      (p) => api(`/api/courses/${courseId}/attendance/records`, { method: "POST", body: JSON.stringify({ sessionId, studentRosterId: s.id, present: p }) }),
+      !!detail.attendanceRecords[s.id]?.[sessionId]));
   const sessions = [...detail.attendanceSessions].sort((a, b) => +new Date(a.session_date) - +new Date(b.session_date));
 
   return (
@@ -1239,19 +1583,21 @@ function Attendance({ detail, students, courseId, onRefresh }: { detail: CourseD
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, minWidth: 500 + sessions.length * 60 }}>
             <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg }}>
               <th style={{ textAlign: "left", padding: "8px 10px" }}>Student</th>
-              {sessions.map((s) => (<th key={s.id} style={{ padding: "8px 6px", textAlign: "center", fontWeight: 600 }}><div>{new Date(s.session_date).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</div>{canEdit && <button onClick={() => removeSession(s.id)} style={{ fontSize: 10, color: THEME.textFaint, background: "none", border: "none", cursor: "pointer" }}>remove</button>}</th>))}
+              {sessions.map((s) => {
+                const allPresent = students.length > 0 && students.every((st) => isPresent(st.id, s.id));
+                return (<th key={s.id} style={{ padding: "8px 6px", textAlign: "center", fontWeight: 600 }}><div>{new Date(s.session_date).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</div>{canEdit && <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1 }}><button onClick={() => markAll(s.id, !allPresent)} style={{ fontSize: 10, color: THEME.greenDark, background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}>{allPresent ? "clear all" : "all present"}</button><button onClick={() => removeSession(s.id)} style={{ fontSize: 10, color: THEME.textFaint, background: "none", border: "none", cursor: "pointer" }}>remove</button></div>}</th>);
+              })}
               <th style={{ padding: "8px 10px", textAlign: "center" }}>Attended</th><th style={{ padding: "8px 10px", textAlign: "center" }}>%</th>
             </tr></thead>
             <tbody>
               {students.map((s) => {
-                const record = detail.attendanceRecords[s.id] || {};
-                const present = Object.values(record).filter(Boolean).length;
+                const present = sessions.filter((sess) => isPresent(s.id, sess.id)).length;
                 const pct = sessions.length ? Math.round((present / sessions.length) * 100) : 0;
                 const displayName = s.name?.trim() ? s.name : s.label;
                 return (
                   <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
                     <td style={{ padding: "6px 10px" }}>{displayName}</td>
-                    {sessions.map((sess) => (<td key={sess.id} style={{ padding: "6px", textAlign: "center" }}><input type="checkbox" checked={!!record[sess.id]} disabled={!canEdit} onChange={() => toggle(s.id, sess.id, !!record[sess.id])} style={{ width: 15, height: 15, cursor: canEdit ? "pointer" : "default" }} /></td>))}
+                    {sessions.map((sess) => (<td key={sess.id} style={{ padding: "6px", textAlign: "center", background: draft.has(attKey(s.id, sess.id)) ? "#FFF3DF" : undefined }}><input type="checkbox" checked={isPresent(s.id, sess.id)} disabled={!canEdit} onChange={() => toggle(s.id, sess.id)} style={{ width: 15, height: 15, cursor: canEdit ? "pointer" : "default" }} /></td>))}
                     <td style={{ padding: "6px 10px", textAlign: "center", fontWeight: 600 }}>{present}/{sessions.length}</td>
                     <td style={{ padding: "6px 10px", textAlign: "center", fontWeight: 600, color: pct >= 75 ? THEME.greenDark : "#A32D2D" }}>{pct}%</td>
                   </tr>
@@ -1261,6 +1607,7 @@ function Attendance({ detail, students, courseId, onRefresh }: { detail: CourseD
           </table>
         </div>
       )}
+      {canEdit && sessions.length > 0 && <SaveBar draft={draft} />}
     </div>
   );
 }
@@ -1292,11 +1639,16 @@ function FacultyPayout({ batchId }: { batchId: string }) {
   };
   const removeSession = async (id: string) => { await api(`/api/faculty-sessions/${id}`, { method: "DELETE" }); loadSessions(facultyId); };
   const updateSession = async (id: string, patch: any) => { await api(`/api/faculty-sessions/${id}`, { method: "PATCH", body: JSON.stringify(patch) }); loadSessions(facultyId); };
+  const draft = useDraft("faculty-payout", () => loadSessions(facultyId));
+  const stageNum = (id: string, field: "hours" | "rate", value: string, original: number) =>
+    draft.stage(`fs:${id}:${field}`, Number(value), (v) => api(`/api/faculty-sessions/${id}`, { method: "PATCH", body: JSON.stringify({ [field]: v }) }), Number(original));
+  const hoursOf = (x: any) => Number(draft.get(`fs:${x.id}:hours`, x.hours)) || 0;
+  const rateOf = (x: any) => Number(draft.get(`fs:${x.id}:rate`, x.rate)) || 0;
   const toggleSelect = (id: string) => setSelected((s) => ({ ...s, [id]: !s[id] }));
   const markSelectedPaid = async () => { await Promise.all(Object.entries(selected).filter(([, v]) => v).map(([id]) => api(`/api/faculty-sessions/${id}`, { method: "PATCH", body: JSON.stringify({ paid: true }) }))); setSelected({}); loadSessions(facultyId); };
 
-  const totalUnpaid = sessions.filter((s) => !s.paid).reduce((sum, s) => sum + s.hours * s.rate, 0);
-  const totalAll = sessions.reduce((sum, s) => sum + s.hours * s.rate, 0);
+  const totalUnpaid = sessions.filter((s) => !s.paid).reduce((sum, s) => sum + hoursOf(s) * rateOf(s), 0);
+  const totalAll = sessions.reduce((sum, s) => sum + hoursOf(s) * rateOf(s), 0);
 
   return (
     <div>
@@ -1311,7 +1663,7 @@ function FacultyPayout({ batchId }: { batchId: string }) {
         <>
           <div style={{ marginBottom: 20 }}>
             <label style={{ fontSize: 12, color: THEME.textMuted }}>Faculty</label><br />
-            <select value={facultyId} onChange={(e) => setFacultyId(e.target.value)} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, minWidth: 220 }}>
+            <select value={facultyId} onChange={(e) => { if (!draft.count || window.confirm("You have unsaved changes for this faculty member. Discard them?")) { draft.discard(); setFacultyId(e.target.value); } }} style={{ padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, minWidth: 220 }}>
               {facultyList.map((f) => <option key={f.id} value={f.id}>{f.name} — {f.pay_rate ? `₹${f.pay_rate}/hr` : "no rate set"}</option>)}
             </select>
           </div>
@@ -1325,7 +1677,7 @@ function FacultyPayout({ batchId }: { batchId: string }) {
 
           {sessions.length === 0 ? <div style={{ color: THEME.textFaint, fontSize: 13 }}>No hours logged yet for this faculty member.</div> : (
             <>
-              <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
+              <div key={draft.version} style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, minWidth: 780 }}>
                   <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg, textAlign: "left" }}>
                     <th style={{ padding: "8px" }}></th><th style={{ padding: "8px" }}>Date</th><th style={{ padding: "8px" }}>Topic</th>
@@ -1334,14 +1686,14 @@ function FacultyPayout({ batchId }: { batchId: string }) {
                   </tr></thead>
                   <tbody>
                     {sessions.map((s) => {
-                      const rowTotal = (Number(s.hours) || 0) * (Number(s.rate) || 0);
+                      const rowTotal = hoursOf(s) * rateOf(s);
                       return (
                         <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
                           <td style={{ padding: "6px 8px" }}><input type="checkbox" checked={!!selected[s.id]} onChange={() => toggleSelect(s.id)} disabled={s.paid} /></td>
                           <td style={{ padding: "6px 8px" }}>{new Date(s.session_date).toLocaleDateString("en-IN")}</td>
                           <td style={{ padding: "6px 8px" }}>{s.topic || "—"}</td>
-                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" min={0} step={0.5} defaultValue={s.hours} onBlur={(e) => updateSession(s.id, { hours: Number(e.target.value) })} style={{ width: 55, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
-                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" defaultValue={s.rate} onBlur={(e) => updateSession(s.id, { rate: Number(e.target.value) })} style={{ width: 65, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}` }} disabled={s.paid} /></td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" min={0} step={0.5} defaultValue={draft.get(`fs:${s.id}:hours`, s.hours)} onChange={(e) => stageNum(s.id, "hours", e.target.value, s.hours)} style={{ width: 55, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(`fs:${s.id}:hours`)) }} disabled={s.paid} /></td>
+                          <td style={{ padding: "6px 8px", textAlign: "center" }}><input type="number" defaultValue={draft.get(`fs:${s.id}:rate`, s.rate)} onChange={(e) => stageNum(s.id, "rate", e.target.value, s.rate)} style={{ width: 65, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(`fs:${s.id}:rate`)) }} disabled={s.paid} /></td>
                           <td style={{ padding: "6px 8px", textAlign: "center", fontWeight: 700, color: THEME.greenDark }}>₹{rowTotal.toLocaleString("en-IN")}</td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => updateSession(s.id, { paid: !s.paid })} style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 20, border: "none", cursor: "pointer", background: s.paid ? THEME.greenLight : "#FCEBEB", color: s.paid ? THEME.greenDark : "#A32D2D" }}>{s.paid ? "Paid" : "Unpaid"}</button></td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}><button onClick={() => removeSession(s.id)} style={{ fontSize: 11, background: "none", border: "none", color: THEME.textFaint, cursor: "pointer" }}>Remove</button></td>
@@ -1355,6 +1707,7 @@ function FacultyPayout({ batchId }: { batchId: string }) {
                 <div style={{ fontSize: 13.5, color: THEME.textMuted }}>Total (all time): <strong style={{ color: THEME.navy }}>₹{totalAll.toLocaleString("en-IN")}</strong> · Still owed: <strong style={{ color: "#A32D2D" }}>₹{totalUnpaid.toLocaleString("en-IN")}</strong></div>
                 <button onClick={markSelectedPaid} disabled={!Object.values(selected).some(Boolean)} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.navy, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer", opacity: Object.values(selected).some(Boolean) ? 1 : 0.5 }}>Mark selected as Paid</button>
               </div>
+              <SaveBar draft={draft} />
             </>
           )}
         </>
@@ -1379,10 +1732,22 @@ function StudentFees({ batchId, students, onStudentsChanged }: { batchId: string
   }, [batchId]);
   useEffect(() => { loadPlans(); loadPayments(); }, [loadPlans, loadPayments]);
 
-  const plan = plans[category] || { token: 0, inst1: 0, inst2: 0, inst3: 0, inst4: 0 };
-  const updatePlanField = async (field: string, value: string) => { await api("/api/fee-plans", { method: "PATCH", body: JSON.stringify({ batchId, category, field, value: Number(value) }) }); loadPlans(); };
-  const setPaid = async (studentRosterId: string, field: string, value: string) => { await api("/api/student-fees", { method: "POST", body: JSON.stringify({ studentRosterId, field, amountPaid: Number(value) || 0 }) }); loadPayments(); };
-  const setStudentCategory = async (studentId: string, cat: string) => { await api(`/api/students/${studentId}`, { method: "PATCH", body: JSON.stringify({ feeCategory: cat }) }); onStudentsChanged(); };
+  const draft = useDraft("student-fees", async () => { await Promise.all([loadPlans(), loadPayments(), onStudentsChanged()]); });
+  const EMPTY_PLAN = { token: 0, inst1: 0, inst2: 0, inst3: 0, inst4: 0 };
+  // Plan values with unsaved edits applied, per category.
+  const planFor = (cat: string) => {
+    const saved = plans[cat] || EMPTY_PLAN;
+    return Object.fromEntries(PLAN_FIELDS.map(([f]) => [f, draft.get(`plan:${cat}:${f}`, saved[f])])) as Record<string, number>;
+  };
+  const plan = planFor(category);
+  const updatePlanField = (field: string, value: string) => {
+    const cat = category;
+    draft.stage(`plan:${cat}:${field}`, Number(value) || 0, (v) => api("/api/fee-plans", { method: "PATCH", body: JSON.stringify({ batchId, category: cat, field, value: v }) }), Number((plans[cat] || EMPTY_PLAN)[field]) || 0);
+  };
+  const setPaid = (studentRosterId: string, field: string, value: string) =>
+    draft.stage(`pay:${studentRosterId}:${field}`, Number(value) || 0, (v) => api("/api/student-fees", { method: "POST", body: JSON.stringify({ studentRosterId, field, amountPaid: v }) }), Number(payments[studentRosterId]?.[field]) || 0);
+  const setStudentCategory = (s: StudentRow, cat: string) =>
+    draft.stage(`cat:${s.id}`, cat, (v) => api(`/api/students/${s.id}`, { method: "PATCH", body: JSON.stringify({ feeCategory: v }) }), s.fee_category || "General");
 
   return (
     <div>
@@ -1397,12 +1762,12 @@ function StudentFees({ batchId, students, onStudentsChanged }: { batchId: string
         </div>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
           {PLAN_FIELDS.map(([field, label]) => (
-            <div key={field}><label style={{ fontSize: 11.5, color: THEME.textMuted }}>{label} (₹)</label><br /><input type="number" defaultValue={plan[field]} onBlur={(e) => updatePlanField(field, e.target.value)} style={{ width: 100, padding: "7px 9px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13 }} /></div>
+            <div key={field}><label style={{ fontSize: 11.5, color: THEME.textMuted }}>{label} (₹)</label><br /><input key={`${category}-${field}-${draft.version}-${plans[category]?.[field] ?? 0}`} type="number" defaultValue={plan[field]} onChange={(e) => updatePlanField(field, e.target.value)} style={{ width: 100, padding: "7px 9px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, ...dirtyStyle(draft.has(`plan:${category}:${field}`)) }} /></div>
           ))}
         </div>
       </div>
 
-      <div style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
+      <div key={draft.version} style={{ overflowX: "auto", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, minWidth: 1000 }}>
           <thead><tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg, textAlign: "left" }}>
             <th style={{ padding: "8px" }}>Student</th><th style={{ padding: "8px" }}>Category</th>
@@ -1411,17 +1776,17 @@ function StudentFees({ batchId, students, onStudentsChanged }: { batchId: string
           </tr></thead>
           <tbody>
             {students.map((s) => {
-              const cat = s.fee_category || "General";
-              const studentPlan = plans[cat] || plan;
+              const cat = draft.get(`cat:${s.id}`, s.fee_category || "General");
+              const studentPlan = planFor(cat);
               const totalDue = PLAN_FIELDS.reduce((sum, [f]) => sum + (Number(studentPlan[f]) || 0), 0);
-              const studentPayments = payments[s.id] || {};
+              const studentPayments = Object.fromEntries(PLAN_FIELDS.map(([f]) => [f, draft.get(`pay:${s.id}:${f}`, payments[s.id]?.[f] ?? 0)]));
               const paid = PLAN_FIELDS.reduce((sum, [f]) => sum + Math.min(Number(studentPayments[f]) || 0, Number(studentPlan[f]) || 0), 0);
               const displayName = s.name?.trim() ? s.name : s.label;
               return (
                 <tr key={s.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
                   <td style={{ padding: "6px 8px" }}>{displayName}</td>
                   <td style={{ padding: "6px 8px" }}>
-                    <select value={cat} onChange={(e) => setStudentCategory(s.id, e.target.value)} style={{ padding: "4px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 11.5 }}>
+                    <select value={cat} onChange={(e) => setStudentCategory(s, e.target.value)} style={{ padding: "4px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 11.5, ...dirtyStyle(draft.has(`cat:${s.id}`)) }}>
                       <option value="General">General</option><option value="Reserved">Reserved</option>
                     </select>
                   </td>
@@ -1434,7 +1799,7 @@ function StudentFees({ batchId, students, onStudentsChanged }: { batchId: string
                     return (
                       <td key={field} style={{ padding: "6px 8px", textAlign: "center", background: cellBg }}>
                         <div style={{ fontSize: 10, color: THEME.textFaint, marginBottom: 3 }}>Due ₹{due.toLocaleString("en-IN")}</div>
-                        <input type="number" min={0} defaultValue={paidAmt} onBlur={(e) => setPaid(s.id, field, e.target.value)} style={{ width: 72, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 11.5 }} />
+                        <input type="number" min={0} defaultValue={paidAmt} onChange={(e) => setPaid(s.id, field, e.target.value)} style={{ width: 72, padding: "4px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 11.5, ...dirtyStyle(draft.has(`pay:${s.id}:${field}`)) }} />
                         <div style={{ fontSize: 9.5, fontWeight: 700, color: cellText, marginTop: 2, textTransform: "capitalize" }}>{status}</div>
                       </td>
                     );
@@ -1447,6 +1812,7 @@ function StudentFees({ batchId, students, onStudentsChanged }: { batchId: string
           </tbody>
         </table>
       </div>
+      <SaveBar draft={draft} />
     </div>
   );
 }
@@ -1500,6 +1866,99 @@ function MyResults({ courses, studentId }: { courses: CourseSummary[]; studentId
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+function MisReports({ courses, batchId, batchName }: { courses: CourseSummary[]; batchId: string; batchName: string }) {
+  const [period, setPeriod] = useState<"week" | "month" | "overall">("week");
+  const [courseId, setCourseId] = useState("all");
+  const [data, setData] = useState<MisData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError("");
+    api(`/api/reports/mis?batchId=${batchId}&period=${period}&courseId=${courseId}`)
+      .then((d) => { if (!cancelled) setData(d); })
+      .catch((e) => { if (!cancelled) { setData(null); setError(e.message); } })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [batchId, period, courseId]);
+
+  const download = async () => {
+    if (!data) return;
+    setDownloading(true); setError("");
+    try {
+      const { buildMisReportPdf } = await import("@/lib/misReport");
+      const { doc, filename } = await buildMisReportPdf(data);
+      doc.save(filename);
+    } catch (e: any) {
+      setError(`Could not create the PDF: ${e.message || e}`);
+    } finally { setDownloading(false); }
+  };
+
+  const PERIODS: [typeof period, string, string][] = [
+    ["week", "Last 7 days", "Weekly"], ["month", "Last 30 days", "Monthly"], ["overall", "Overall", "Till date"],
+  ];
+  const below = data ? data.students.filter((s) => s.pct !== null && s.pct < 75).length : 0;
+
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>MIS reports</div>
+        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Download a PDF report of attendance and course progress for {batchName || "this batch"}, with charts and a written explanation under each chart.</div>
+      </div>
+
+      <div style={{ padding: 18, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 20 }}>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 12, color: THEME.textMuted, marginBottom: 6 }}>Period</div>
+            <div style={{ display: "flex", gap: 4, background: THEME.bg, padding: 4, borderRadius: 9 }}>
+              {PERIODS.map(([key, label, sub]) => (
+                <button key={key} onClick={() => setPeriod(key)} style={{ padding: "7px 14px", border: "none", borderRadius: 6, cursor: "pointer", textAlign: "left",
+                  background: period === key ? THEME.green : "transparent", color: period === key ? "white" : THEME.textMuted }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700 }}>{label}</div>
+                  <div style={{ fontSize: 10.5, opacity: 0.85 }}>{sub}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: THEME.textMuted, marginBottom: 6 }}>Subject</div>
+            <select value={courseId} onChange={(e) => setCourseId(e.target.value)} style={{ padding: "10px 12px", borderRadius: 8, border: `1px solid ${THEME.border}`, fontSize: 13, minWidth: 260 }}>
+              <option value="all">All subjects (overall + subject-wise)</option>
+              {courses.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <button onClick={download} disabled={!data || loading || downloading}
+            style={{ display: "flex", alignItems: "center", gap: 7, padding: "11px 20px", borderRadius: 8, border: "none", background: THEME.navy, color: "white", fontSize: 13.5, fontWeight: 700,
+              cursor: data && !loading && !downloading ? "pointer" : "default", opacity: data && !loading && !downloading ? 1 : 0.6 }}>
+            <Download size={16} /> {downloading ? "Preparing PDF…" : "Download PDF report"}
+          </button>
+        </div>
+        {error && <div style={{ marginTop: 12, fontSize: 12.5, color: "#A32D2D" }}>{error}</div>}
+      </div>
+
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 10 }}>
+        Preview {data && <span style={{ fontWeight: 400, color: THEME.textMuted }}>· {data.periodLabel}{data.startDate ? ` · ${new Date(`${data.startDate}T00:00:00Z`).toLocaleDateString("en-IN", { day: "2-digit", month: "short", timeZone: "UTC" })} – ${new Date(`${data.endDate}T00:00:00Z`).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" })}` : ""}</span>}
+      </div>
+      {loading ? <div style={{ color: THEME.textMuted, fontSize: 13, marginBottom: 20 }}>Loading figures…</div> : data && (
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20 }}>
+          <StatCard icon={ClipboardCheck} label="Average attendance" value={data.overall.pct !== null ? `${data.overall.pct}%` : "No data"}
+            sub={data.overall.prevPct !== null && data.overall.pct !== null ? `${data.overall.pct - data.overall.prevPct >= 0 ? "+" : ""}${Math.round((data.overall.pct - data.overall.prevPct) * 10) / 10} pts vs previous period` : `${data.studentCount} students`}
+            accent={data.overall.pct !== null && data.overall.pct < 75 ? "#C23B3B" : THEME.green} />
+          <StatCard icon={CalendarDays} label="Lectures held" value={data.overall.sessions} sub={data.scope ? data.scope.courseName : `across ${data.subjects.length} subjects`} />
+          <StatCard icon={TrendingUp} label="Syllabus completed" value={`${data.progress.pct}%`} sub={`${data.progress.modulesCompleted} of ${data.progress.modulesTotal} modules`} accent={THEME.green} />
+          <StatCard icon={Users} label="Students below 75%" value={below} sub={`of ${data.studentCount} students`} accent={below ? "#C23B3B" : THEME.green} />
+        </div>
+      )}
+
+      <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.bg, fontSize: 13, color: THEME.textMuted, lineHeight: 1.6 }}>
+        <strong style={{ color: THEME.navy }}>What the PDF contains.</strong> A summary page with the headline figures and key findings, then an attendance section (attendance by {courseId === "all" ? "subject" : "lecture session"}, the attendance trend over the period, students grouped by attendance band, and a follow-up list of students below 75%), then a course progress section (syllabus progress{courseId === "all" ? " by subject" : " and a module-by-module status"}). Every chart has a plain-English explanation of what it shows. Weekly and monthly reports also compare attendance with the previous period.
+      </div>
     </div>
   );
 }
