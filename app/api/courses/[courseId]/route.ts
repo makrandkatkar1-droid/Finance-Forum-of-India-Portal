@@ -90,10 +90,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ co
   const res = await query(
     `UPDATE courses SET
        day_allocated = COALESCE($1, day_allocated),
-       day_parity = $2,
+       day_parity = CASE WHEN $5::boolean THEN $2 ELSE day_parity END,
        results_published = COALESCE($3, results_published)
      WHERE id = $4 RETURNING id, name, day_allocated, day_parity, results_published`,
-    [dayAllocated ?? null, dayParity === undefined ? null : dayParity, resultsPublished === undefined ? null : resultsPublished, courseId]
+    [dayAllocated ?? null, dayParity ?? null, resultsPublished === undefined ? null : resultsPublished, courseId, dayParity !== undefined]
   );
 
   if (res.rows.length === 0) return NextResponse.json({ error: "Course not found." }, { status: 404 });
