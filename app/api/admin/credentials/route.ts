@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import bcrypt from "bcryptjs";
-import { query, logAudit } from "@/lib/db";
+import { query } from "@/lib/db";
 import { getSession } from "@/lib/auth";
 
 export async function GET(req: NextRequest) {
@@ -8,54 +7,72 @@ export async function GET(req: NextRequest) {
   if (!session || session.role !== "admin") return NextResponse.json({ error: "Admin access only." }, { status: 403 });
 
   const batchId = req.nextUrl.searchParams.get("batchId");
+  if (!batchId) return NextResponse.json({ error: "batchId query param required." }, { status: 400 });
+  // Optional: count only the lectures of one semester's subjects.
+  const semesterId = req.nextUrl.searchParams.get("semesterId");
+  const semFilter = semesterId ? "AND c.semester_id = $2" : "";
+  const courseArgs = semesterId ? [batchId, semesterId] : [batchId];
 
-  const admin = await query("SELECT id, username FROM users WHERE role = 'admin' LIMIT 1");
-  // One row per faculty member. course_id is their first subject in the batch
-  // (used to tag payout entries); faculty teaching several subjects appear once.
-  const faculty = await query(
-    `SELECT DISTINCT ON (u.name, u.id) u.id, u.name, u.username, u.pay_rate, c.id AS course_id, c.name AS course_name, c.batch_id FROM users u
-     LEFT JOIN courses c ON c.faculty_id = u.id ${batchId ? "AND c.batch_id = $1" : ""}
-     WHERE u.role = 'faculty' ${batchId ? "AND c.id IS NOT NULL" : ""}
-     ORDER BY u.name, u.id, c.name`,
-    batchId ? [batchId] : []
+  const courseSessionsRes = await query(
+    `SELECT COUNT(asess.id)::int AS n
+     FROM courses c LEFT JOIN attendance_sessions asess ON asess.course_id = c.id
+     WHERE c.batch_id = $1 ${semFilter}`,
+    courseArgs
+  );
+  const totalCourseSessions = courseSessionsRes.rows[0]?.n || 0;
+
+  const eventsRes = await query(`SELECT COUNT(*)::int AS n FROM calendar_events WHERE batch_id = $1`, [batchId]);
+  const totalEvents = eventsRes.rows[0]?.n || 0;
+
+  const totalDenominator = totalCourseSessions + totalEvents;
+
+  const coursePresentRes = await query(
+    `SELECT ar.student_roster_id, COUNT(*)::int AS present_count
+     FROM attendance_records ar
+     JOIN attendance_sessions asess ON asess.id = ar.session_id
+     JOIN courses c ON c.id = asess.course_id
+     WHERE c.batch_id = $1 ${semFilter} AND ar.present = true
+     GROUP BY ar.student_roster_id`,
+    courseArgs
   );
 
-  return NextResponse.json({
-    admin: admin.rows[0] || null,
-    faculty: faculty.rows,
+  const eventPresentRes = await query(
+    `SELECT ea.student_roster_id, COUNT(*)::int AS present_count
+     FROM event_attendance ea
+     JOIN calendar_events ce ON ce.id = ea.event_id
+     WHERE ce.batch_id = $1 AND ea.present = true
+     GROUP BY ea.student_roster_id`,
+    [batchId]
+  );
+
+  const coursePresent: Record<string, number> = {};
+  for (const row of coursePresentRes.rows) coursePresent[row.student_roster_id] = row.present_count;
+  const eventPresent: Record<string, number> = {};
+  for (const row of eventPresentRes.rows) eventPresent[row.student_roster_id] = row.present_count;
+
+  const studentsRes = await query(`SELECT id, label, name FROM student_roster WHERE batch_id = $1 ORDER BY seat_number`, [batchId]);
+
+  const students = studentsRes.rows.map((s) => {
+    const present = (coursePresent[s.id] || 0) + (eventPresent[s.id] || 0);
+    const pct = totalDenominator ? Math.round((present / totalDenominator) * 100) : null;
+    return {
+      id: s.id,
+      name: s.name?.trim() ? s.name : s.label,
+      coursePresent: coursePresent[s.id] || 0,
+      eventPresent: eventPresent[s.id] || 0,
+      totalPresent: present,
+      pct,
+    };
   });
-}
 
-export async function PATCH(req: NextRequest) {
-  const session = await getSession();
-  if (!session || session.role !== "admin") return NextResponse.json({ error: "Admin access only." }, { status: 403 });
+  const withData = students.filter((s) => s.pct !== null);
+  const overallAvg = withData.length ? Math.round(withData.reduce((sum, s) => sum + (s.pct || 0), 0) / withData.length) : null;
 
-  const { userId, name, username, password, payRate } = await req.json();
-  if (!userId) return NextResponse.json({ error: "userId is required." }, { status: 400 });
-
-  const sets: string[] = [];
-  const values: unknown[] = [];
-  let i = 1;
-
-  if (name !== undefined) {
-    if (!String(name).trim()) return NextResponse.json({ error: "Name cannot be empty." }, { status: 400 });
-    sets.push(`name = $${i++}`); values.push(String(name).trim());
-  }
-  if (username) {
-    const clean = String(username).trim();
-    if (/\s/.test(clean)) return NextResponse.json({ error: "Username cannot contain spaces." }, { status: 400 });
-    const taken = await query("SELECT 1 FROM users WHERE lower(username) = lower($1) AND id <> $2", [clean, userId]);
-    if (taken.rows.length) return NextResponse.json({ error: `The username "${clean}" is already in use.` }, { status: 409 });
-    sets.push(`username = $${i++}`); values.push(clean);
-  }
-  if (password) { sets.push(`password_hash = $${i++}`); values.push(await bcrypt.hash(password, 10)); }
-  if (payRate !== undefined) { sets.push(`pay_rate = $${i++}`); values.push(payRate); }
-  if (sets.length === 0) return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
-
-  values.push(userId);
-  const res = await query(`UPDATE users SET ${sets.join(", ")} WHERE id = $${i} RETURNING id, name, username, role, pay_rate`, values);
-  if (res.rows.length === 0) return NextResponse.json({ error: "User not found." }, { status: 404 });
-
-  await logAudit(session.id, session.name, "users", userId, `Updated login credentials for ${res.rows[0].name}`);
-  return NextResponse.json({ user: res.rows[0] });
+  return NextResponse.json({
+    totalCourseSessions,
+    totalEvents,
+    totalDenominator,
+    students,
+    overallAvg,
+  });
 }
