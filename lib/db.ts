@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 
 declare global {
   // eslint-disable-next-line no-var
@@ -18,6 +18,22 @@ if (process.env.NODE_ENV !== "production") {
 
 export async function query(text: string, params?: unknown[]) {
   return pool.query(text, params);
+}
+
+// Run several statements as one unit: either all of them are saved or none are.
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function logAudit(actorId: string | null, actorName: string, table: string, recordId: string | null, action: string) {
