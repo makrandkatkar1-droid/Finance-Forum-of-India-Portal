@@ -8,12 +8,16 @@ export async function GET(req: NextRequest) {
 
   const batchId = req.nextUrl.searchParams.get("batchId");
   if (!batchId) return NextResponse.json({ error: "batchId query param required." }, { status: 400 });
+  // Optional: count only the lectures of one semester's subjects.
+  const semesterId = req.nextUrl.searchParams.get("semesterId");
+  const semFilter = semesterId ? "AND c.semester_id = $2" : "";
+  const courseArgs = semesterId ? [batchId, semesterId] : [batchId];
 
   const courseSessionsRes = await query(
     `SELECT COUNT(asess.id)::int AS n
      FROM courses c LEFT JOIN attendance_sessions asess ON asess.course_id = c.id
-     WHERE c.batch_id = $1`,
-    [batchId]
+     WHERE c.batch_id = $1 ${semFilter}`,
+    courseArgs
   );
   const totalCourseSessions = courseSessionsRes.rows[0]?.n || 0;
 
@@ -27,9 +31,9 @@ export async function GET(req: NextRequest) {
      FROM attendance_records ar
      JOIN attendance_sessions asess ON asess.id = ar.session_id
      JOIN courses c ON c.id = asess.course_id
-     WHERE c.batch_id = $1 AND ar.present = true
+     WHERE c.batch_id = $1 ${semFilter} AND ar.present = true
      GROUP BY ar.student_roster_id`,
-    [batchId]
+    courseArgs
   );
 
   const eventPresentRes = await query(
