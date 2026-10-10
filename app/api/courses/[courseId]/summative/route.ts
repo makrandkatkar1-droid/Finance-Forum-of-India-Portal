@@ -17,7 +17,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ cou
   if (!studentRosterId || marks === undefined) {
     return NextResponse.json({ error: "studentRosterId and marks are required." }, { status: 400 });
   }
-  const clamped = Math.max(0, Math.min(50, Number(marks)));
+  const maxRes = await query("SELECT external_max_marks FROM courses WHERE id = $1", [courseId]);
+  const externalMax = Number(maxRes.rows[0]?.external_max_marks ?? 50);
+  const clamped = Math.max(0, Math.min(externalMax, Number(marks)));
 
   await query(
     `INSERT INTO summative_marks (course_id, student_roster_id, marks_obtained, graded_by)
