@@ -12,7 +12,7 @@ import {
   FileText, Award, History, LogOut, Users, TrendingUp, Clock,
   ChevronRight, ChevronLeft, CalendarClock, CalendarRange, Settings,
   ClipboardCheck, Bell, X, Download, Wallet, Receipt, Layers, Plus, CheckCircle,
-  Save, Trash2, FileChartColumn, TriangleAlert,
+  Save, Trash2, FileChartColumn, TriangleAlert, GraduationCap, ArrowUp, ArrowDown, Pencil, UserPlus, Star,
 } from "lucide-react";
 
 const THEME = {
@@ -24,10 +24,14 @@ const THEME = {
   orange: "#C5761F", orangeLight: "#FBEDDB",
 };
 const DAYS_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const GLOBAL_TABS = ["org", "monthly", "weekly-sched", "subjects", "credentials", "audit", "batches", "payout", "fees", "myresults", "reports"];
+// Subjects created before semesters existed have no semester; treat them as the first one.
+function semesterOf(c: CourseSummary, sems: Semester[]) { return c.semester_id || sems[0]?.id || null; }
 
 type SessionUser = { id: string; name: string; username: string; role: string; courseId?: string | null; studentId?: string | null; batchId?: string | null };
 type Batch = { id: string; name: string };
-type CourseSummary = { id: string; name: string; code: string; day_allocated: string; day_parity: string | null; total_hours: number; batch_id: string; results_published: boolean; faculty_name: string };
+type CourseSummary = { id: string; name: string; code: string; day_allocated: string | null; day_parity: string | null; total_hours: number | null; batch_id: string; results_published: boolean; faculty_name: string; faculty_id: string; semester_id: string | null; external_max_marks: number };
+type Semester = { id: string; name: string; semester_number: number; is_current: boolean; subject_count: number };
 type ModuleRow = { id: string; module_number: number; module_name: string | null; status: string; completed_date: string | null };
 type WeeklyPlanRow = { id: string; week_number: number; week_start_date: string; session_type: string; activity_name: string | null; topics: string; module_id: string | null };
 type AssignmentRow = { id: string; title: string; description: string | null; deadline: string };
@@ -77,6 +81,10 @@ function computeFormativeTotal(detail: CourseDetail, studentId: string) {
     return sum + (Number(row[comp.id]) || 0);
   }, 0);
 }
+
+// Totals follow each subject's own internal pattern and external marks.
+function formativeMax(detail: CourseDetail) { return detail.components.reduce((sum, c) => sum + Number(c.max_marks || 0), 0); }
+function externalMax(course: CourseSummary) { return Number(course.external_max_marks ?? 50); }
 
 async function api(url: string, options?: RequestInit) {
   const res = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...(options?.headers || {}) } });
@@ -214,9 +222,11 @@ const dirtyStyle = (isDirty: boolean) => (isDirty ? { borderColor: THEME.orange,
 export default function DashboardPage() {
   const router = useRouter();
   const [user, setUser] = useState<SessionUser | null>(null);
-  const [batches, setBatches] = useState<Batch[]>([]);
+  const [batches, setBatches] = useState<Batch[] | null>(null);
   const [batchId, setBatchId] = useState<string | null>(null);
-  const [courses, setCourses] = useState<CourseSummary[]>([]);
+  const [semesters, setSemesters] = useState<Semester[]>([]);
+  const [semesterId, setSemesterId] = useState<string | null>(null);
+  const [allCourses, setAllCourses] = useState<CourseSummary[]>([]);
   const [students, setStudents] = useState<StudentRow[]>([]);
   const [activeCourseId, setActiveCourseId] = useState<string | null>(null);
   const [detail, setDetail] = useState<CourseDetail | null>(null);
@@ -225,20 +235,26 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
 
+  // Who am I, and which batches may I see? Students and faculty are locked to
+  // their own batch(es) by the server; only the admin can switch freely.
   useEffect(() => {
-    api("/api/auth/me").then((d) => {
+    api("/api/auth/me").then(async (d) => {
       if (!d.user) { router.replace("/"); return; }
       setUser(d.user);
-      const bId = d.user.batchId || (typeof window !== "undefined" ? localStorage.getItem("ffoi_batch_id") : null);
-      setBatchId(bId);
+      const list: Batch[] = (await api("/api/batches")).batches || [];
+      setBatches(list);
+      const stored = typeof window !== "undefined" ? localStorage.getItem("ffoi_batch_id") : null;
+      const preferred = d.user.role === "student" ? d.user.batchId : stored;
+      const chosen = list.find((b) => b.id === preferred)?.id ?? list[0]?.id ?? null;
+      setBatchId(chosen);
+      if (!chosen) setLoading(false);
     });
-    api("/api/batches").then((d) => setBatches(d.batches || []));
   }, [router]);
 
   const loadCourses = useCallback(async (bId: string) => {
     const d = await api(`/api/courses?batchId=${bId}`);
-    setCourses(d.courses || []);
-    return d.courses || [];
+    setAllCourses(d.courses || []);
+    return (d.courses || []) as CourseSummary[];
   }, []);
 
   const loadStudents = useCallback(async (bId: string) => {
@@ -246,22 +262,50 @@ export default function DashboardPage() {
     setStudents(d.students || []);
   }, []);
 
+  const loadSemesters = useCallback(async (bId: string) => {
+    const d = await api(`/api/semesters?batchId=${bId}`);
+    setSemesters(d.semesters || []);
+    return (d.semesters || []) as Semester[];
+  }, []);
+
+  // Load everything for the batch, then open the right semester:
+  // the one this person last looked at, else the current semester.
   useEffect(() => {
     if (!user || !batchId) return;
     (async () => {
-      const cs = await loadCourses(batchId);
-      await loadStudents(batchId);
-      if (cs.length) setActiveCourseId((prev: string | null) => prev || cs[0].id);
+      const [cs, sems] = await Promise.all([loadCourses(batchId), loadSemesters(batchId), loadStudents(batchId)]);
+      const stored = typeof window !== "undefined" ? localStorage.getItem(`ffoi_semester_${batchId}`) : null;
+      const hasMine = (sid: string) => cs.some((c) => semesterOf(c, sems) === sid);
+      const current = sems.find((s) => s.is_current);
+      let pick: string | null = null;
+      if (stored && sems.some((s) => s.id === stored)) pick = stored;
+      else if (current && (user.role === "admin" || hasMine(current.id))) pick = current.id;
+      else pick = ([...sems].reverse().find((s) => hasMine(s.id)) || current || sems[0])?.id ?? null;
+      setSemesterId(pick);
       setLoading(false);
     })();
-  }, [user, batchId, loadCourses, loadStudents]);
+  }, [user, batchId, loadCourses, loadSemesters, loadStudents]);
+
+  // Subjects of the selected semester. Every screen below works on this list.
+  const courses = useMemo(
+    () => allCourses.filter((c) => semesterOf(c, semesters) === semesterId),
+    [allCourses, semesters, semesterId]
+  );
+
+  // Keep the open subject inside the selected semester.
+  useEffect(() => {
+    setActiveCourseId((prev) => (prev && courses.some((c) => c.id === prev) ? prev : courses[0]?.id ?? null));
+  }, [courses]);
 
   const loadDetail = useCallback(async (courseId: string) => {
     const d = await api(`/api/courses/${courseId}`);
     setDetail(d);
   }, []);
 
-  useEffect(() => { if (activeCourseId) loadDetail(activeCourseId); }, [activeCourseId, refreshKey, loadDetail]);
+  useEffect(() => {
+    if (activeCourseId) loadDetail(activeCourseId).catch(() => setDetail(null));
+    else setDetail(null);
+  }, [activeCourseId, refreshKey, loadDetail]);
 
   useEffect(() => {
     if (activeTab === "audit" && user?.role === "admin") {
@@ -276,7 +320,12 @@ export default function DashboardPage() {
   // Every navigation goes through here so unsaved changes are never lost silently.
   const go = (fn: () => void) => { if (confirmLeave()) fn(); };
   const openTab = (tab: string) => go(() => setActiveTab(tab));
-  const openCourse = (id: string) => go(() => { setActiveCourseId(id); setActiveTab("home"); });
+  const openCourse = (id: string) => go(() => {
+    const c = allCourses.find((x) => x.id === id);
+    const sid = c ? semesterOf(c, semesters) : null;
+    if (sid && sid !== semesterId) setSemesterId(sid);
+    setActiveCourseId(id); setActiveTab("home"); refresh();
+  });
 
   async function handleLogout() {
     if (!confirmLeave()) return;
@@ -284,20 +333,53 @@ export default function DashboardPage() {
     router.replace("/");
   }
 
-  function changeBatch() {
-    if (!confirmLeave()) return;
-    if (typeof window !== "undefined") localStorage.removeItem("ffoi_batch_id");
-    handleLogout();
-  }
+  // Only offered to people who can see more than one batch (the admin, or a
+  // faculty member who teaches in two batches) — the server enforces the rest.
+  const changeBatch = (id: string) => go(() => {
+    if (typeof window !== "undefined") localStorage.setItem("ffoi_batch_id", id);
+    setLoading(true); setActiveCourseId(null); setDetail(null);
+    if (!GLOBAL_TABS.includes(activeTab)) setActiveTab("home");
+    setBatchId(id);
+  });
 
-  if (loading || !user || !batchId) {
+  const changeSemester = (id: string) => go(() => {
+    if (typeof window !== "undefined" && batchId) localStorage.setItem(`ffoi_semester_${batchId}`, id);
+    setSemesterId(id);
+    if (!GLOBAL_TABS.includes(activeTab)) setActiveTab("home");
+  });
+
+  const reloadBatchSetup = async () => { if (batchId) await Promise.all([loadCourses(batchId), loadSemesters(batchId)]); refresh(); };
+  const reloadBatches = async () => {
+    const list: Batch[] = (await api("/api/batches")).batches || [];
+    setBatches(list);
+    if (!batchId && list[0]) setBatchId(list[0].id);
+  };
+
+  if (!user || batches === null || (loading && batchId)) {
     return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: THEME.bg, color: THEME.textMuted }}>Loading portal...</div>;
   }
 
-  const courseId = activeCourseId || courses[0]?.id;
+  if (!batchId) {
+    return (
+      <div style={{ minHeight: "100vh", background: THEME.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <div style={{ width: "100%", maxWidth: 560 }}>
+          {user.role === "admin" ? <BatchesPanel batches={batches} onChanged={reloadBatches} /> : (
+            <div style={{ padding: 24, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, fontSize: 14, color: THEME.navy }}>
+              Your account is not linked to a batch yet. Please contact the Operations team.
+            </div>
+          )}
+          <button onClick={handleLogout} style={{ marginTop: 16, padding: "8px 16px", borderRadius: 8, border: `1px solid ${THEME.border}`, background: THEME.card, cursor: "pointer", fontSize: 13 }}>Log out</button>
+        </div>
+      </div>
+    );
+  }
+
+  const courseId = activeCourseId;
   const canEdit = detail?.canEdit ?? false;
   const isAdmin = user.role === "admin";
   const batchName = batches.find((b) => b.id === batchId)?.name || "";
+  const semester = semesters.find((s) => s.id === semesterId) || null;
+  const scopeName = semester ? `${batchName} · ${semester.name}` : batchName;
 
   const navSections = user.role === "student"
     ? ["home", "modules", "plan", "assignments", "tests"]
@@ -312,24 +394,16 @@ export default function DashboardPage() {
     marks: { label: "Marks", icon: Award },
     attendance: { label: "Attendance", icon: ClipboardCheck },
   };
-  const GLOBAL_TABS = ["org", "monthly", "weekly-sched", "credentials", "audit", "batches", "payout", "fees", "myresults", "reports"];
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", background: THEME.bg }}>
       <Sidebar
-        user={user} courses={courses} activeCourseId={courseId} batchName={batchName}
+        user={user} courses={courses} activeCourseId={courseId}
+        batches={batches} batchId={batchId} onChangeBatch={changeBatch}
+        semesters={semesters} semesterId={semesterId} onChangeSemester={changeSemester}
         onSelectCourse={openCourse}
-        onLogout={handleLogout} onChangeBatch={changeBatch} activeTab={activeTab}
-        onOpenOrg={() => openTab("org")}
-        onOpenMonthly={() => openTab("monthly")}
-        onOpenWeeklySched={() => openTab("weekly-sched")}
-        onOpenCredentials={() => openTab("credentials")}
-        onOpenAudit={() => openTab("audit")}
-        onOpenBatches={() => openTab("batches")}
-        onOpenPayout={() => openTab("payout")}
-        onOpenFees={() => openTab("fees")}
-        onOpenMyResults={() => openTab("myresults")}
-        onOpenReports={() => openTab("reports")}
+        onLogout={handleLogout} activeTab={activeTab}
+        onOpenTab={openTab}
       />
 
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -338,27 +412,49 @@ export default function DashboardPage() {
             <NotificationBell />
           </div>
 
-          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} batchId={batchId} onSelectCourse={openCourse} onOpenReports={() => openTab("reports")} />}
-          {activeTab === "reports" && isAdmin && <MisReports courses={courses} batchId={batchId} batchName={batchName} />}
+          {activeTab === "org" && isAdmin && <OrgDashboard courses={courses} batchId={batchId} semesterId={semesterId} scopeName={scopeName} onSelectCourse={openCourse} onOpenReports={() => openTab("reports")} />}
+          {activeTab === "reports" && isAdmin && <MisReports courses={courses} batchId={batchId} semesterId={semesterId} batchName={scopeName} />}
           {activeTab === "monthly" && <MonthlyCalendar courses={courses} isAdmin={isAdmin} batchId={batchId} students={students} onChanged={refresh} />}
           {activeTab === "weekly-sched" && (
             <WeeklyCalendar courses={courses} user={user}
               onSaved={() => loadCourses(batchId)}
               onSelectCourse={openCourse} />
           )}
-          {activeTab === "credentials" && isAdmin && <CredentialsPanel batchId={batchId} students={students} onStudentsChanged={() => loadStudents(batchId)} />}
+          {activeTab === "subjects" && isAdmin && (
+            <SubjectsPanel batchId={batchId} batchName={batchName} semesters={semesters} courses={allCourses}
+              selectedSemesterId={semesterId} onSelectSemester={changeSemester}
+              onChanged={reloadBatchSetup} onOpenCourse={openCourse} onOpenCredentials={() => openTab("credentials")} />
+          )}
+          {activeTab === "credentials" && isAdmin && <CredentialsPanel batchId={batchId} students={students} onStudentsChanged={() => loadStudents(batchId)} onFacultyChanged={reloadBatchSetup} />}
           {activeTab === "audit" && isAdmin && <AuditLog log={auditLog} />}
-          {activeTab === "batches" && isAdmin && <BatchesPanel batches={batches} onChanged={() => api("/api/batches").then((d) => setBatches(d.batches || []))} />}
+          {activeTab === "batches" && isAdmin && <BatchesPanel batches={batches} onChanged={reloadBatches} />}
           {activeTab === "payout" && isAdmin && <FacultyPayout batchId={batchId} />}
           {activeTab === "fees" && isAdmin && <StudentFees batchId={batchId} students={students} onStudentsChanged={() => loadStudents(batchId)} />}
           {activeTab === "myresults" && user.role === "student" && <MyResults courses={courses} studentId={user.studentId!} />}
 
-          {!GLOBAL_TABS.includes(activeTab) && detail && (
+          {!GLOBAL_TABS.includes(activeTab) && !courseId && (
+            <div style={{ padding: 28, border: `1px dashed ${THEME.border}`, borderRadius: 12, background: THEME.card, textAlign: "center" }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: THEME.navy }}>{semester ? `No subjects in ${semester.name} yet` : "No subjects yet"}</div>
+              <div style={{ fontSize: 13, color: THEME.textMuted, marginTop: 6 }}>
+                {isAdmin ? "Add subjects for this semester from Semesters & subjects." : user.role === "faculty" ? "You have no subjects assigned in this semester. Pick another semester in the sidebar." : "Subjects for this semester haven't been added yet."}
+              </div>
+              {isAdmin && (
+                <button onClick={() => openTab("subjects")} style={{ marginTop: 14, display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 8, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                  <GraduationCap size={15} /> Open Semesters & subjects
+                </button>
+              )}
+            </div>
+          )}
+
+          {!GLOBAL_TABS.includes(activeTab) && courseId && detail && detail.course.id === courseId && (
             <>
               <div style={{ marginBottom: 20 }}>
                 <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>{detail.course.name}</div>
                 <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>
-                  {detail.course.faculty_name} · {detail.course.day_allocated}s{weekParityLabel(detail.course.day_parity) ? ` (${weekParityLabel(detail.course.day_parity)})` : ""} · {detail.course.total_hours} hours
+                  {[detail.course.faculty_name,
+                    detail.course.day_allocated ? `${detail.course.day_allocated}s${weekParityLabel(detail.course.day_parity) ? ` (${weekParityLabel(detail.course.day_parity)})` : ""}` : null,
+                    detail.course.total_hours ? `${detail.course.total_hours} hours` : null,
+                    semester?.name].filter(Boolean).join(" · ")}
                   {!canEdit && user.role !== "student" && <span style={{ marginLeft: 10, padding: "2px 8px", borderRadius: 20, fontSize: 11, background: "#F1EFE8", color: THEME.textMuted }}>View only</span>}
                 </div>
               </div>
@@ -378,12 +474,12 @@ export default function DashboardPage() {
               </div>
 
               {activeTab === "home" && <Overview detail={detail} />}
-              {activeTab === "modules" && <Modules detail={detail} courseId={courseId!} onRefresh={reloadDetail} />}
-              {activeTab === "plan" && <WeeklyPlan detail={detail} courseId={courseId!} onRefresh={refresh} />}
-              {activeTab === "assignments" && <Assignments detail={detail} courseId={courseId!} onRefresh={refresh} />}
-              {activeTab === "tests" && <Tests detail={detail} courseId={courseId!} onRefresh={refresh} />}
-              {activeTab === "marks" && user.role !== "student" && <Marks detail={detail} students={students} courseId={courseId!} isAdmin={isAdmin} onRefresh={reloadDetail} />}
-              {activeTab === "attendance" && user.role !== "student" && <Attendance detail={detail} students={students} courseId={courseId!} onRefresh={reloadDetail} />}
+              {activeTab === "modules" && <Modules detail={detail} courseId={courseId} onRefresh={reloadDetail} />}
+              {activeTab === "plan" && <WeeklyPlan detail={detail} courseId={courseId} onRefresh={refresh} />}
+              {activeTab === "assignments" && <Assignments detail={detail} courseId={courseId} onRefresh={refresh} />}
+              {activeTab === "tests" && <Tests detail={detail} courseId={courseId} onRefresh={refresh} />}
+              {activeTab === "marks" && user.role !== "student" && <Marks detail={detail} students={students} courseId={courseId} isAdmin={isAdmin} onRefresh={reloadDetail} />}
+              {activeTab === "attendance" && user.role !== "student" && <Attendance detail={detail} students={students} courseId={courseId} onRefresh={reloadDetail} />}
             </>
           )}
         </div>
@@ -391,16 +487,28 @@ export default function DashboardPage() {
     </div>
   );
 }
-function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onLogout, onChangeBatch, activeTab, onOpenOrg, onOpenMonthly, onOpenWeeklySched, onOpenCredentials, onOpenAudit, onOpenBatches, onOpenPayout, onOpenFees, onOpenMyResults, onOpenReports }: any) {
+
+function Sidebar({ user, courses, activeCourseId, batches, batchId, onChangeBatch, semesters, semesterId, onChangeSemester, onSelectCourse, onLogout, activeTab, onOpenTab }: {
+  user: SessionUser; courses: CourseSummary[]; activeCourseId: string | null;
+  batches: Batch[]; batchId: string; onChangeBatch: (id: string) => void;
+  semesters: Semester[]; semesterId: string | null; onChangeSemester: (id: string) => void;
+  onSelectCourse: (id: string) => void; onLogout: () => void; activeTab: string; onOpenTab: (tab: string) => void;
+}) {
   const roleLabel: Record<string, string> = { admin: "Operations Head", faculty: "Faculty", student: "Student" };
-  const GlobalBtn = ({ active, onClick, icon: Icon, label }: any) => (
-    <button onClick={onClick} style={{ width: "100%", display: "flex", alignItems: "center", gap: 9, padding: "10px 12px", borderRadius: 8,
-      background: active ? THEME.navySoft : "transparent", border: "none", cursor: "pointer",
-      color: active ? "#FFFFFF" : "#B7C2CB", fontSize: 13.5, fontWeight: 600, textAlign: "left" }}>
-      <Icon size={16} />{label}
-    </button>
-  );
-  const visibleCourses = user.role === "faculty" ? courses.filter((c: CourseSummary) => c.id === user.courseId) : courses;
+  const GlobalBtn = ({ tab, icon: Icon, label }: any) => {
+    const active = activeTab === tab;
+    return (
+      <button onClick={() => onOpenTab(tab)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 9, padding: "10px 12px", borderRadius: 8,
+        background: active ? THEME.navySoft : "transparent", border: "none", cursor: "pointer",
+        color: active ? "#FFFFFF" : "#B7C2CB", fontSize: 13.5, fontWeight: 600, textAlign: "left" }}>
+        <Icon size={16} />{label}
+      </button>
+    );
+  };
+  const isAdmin = user.role === "admin";
+  const batchName = batches.find((b) => b.id === batchId)?.name || "";
+  const semesterName = semesters.find((s) => s.id === semesterId)?.name || "";
+  const pickerStyle = { width: "100%", marginTop: 4, padding: "6px 8px", borderRadius: 7, border: "1px solid #2A3D50", background: THEME.navyLight, color: "#EDEFEA", fontSize: 12.5, fontWeight: 600 };
 
   return (
     <div style={{ width: 260, flexShrink: 0, background: THEME.navy, color: "#EDEFEA", display: "flex", flexDirection: "column", minHeight: "100vh" }}>
@@ -414,32 +522,52 @@ function Sidebar({ user, courses, activeCourseId, batchName, onSelectCourse, onL
         </div>
       </div>
 
-      <div style={{ padding: "0 20px 14px" }}>
-        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "#71828E", textTransform: "uppercase" }}>Batch</div>
-        <div style={{ fontSize: 12.5, color: "#EDEFEA", fontWeight: 600, marginTop: 2 }}>{batchName}</div>
-        <button onClick={onChangeBatch} style={{ background: "none", border: "none", padding: 0, fontSize: 11, color: THEME.green, cursor: "pointer", marginTop: 2 }}>Change batch</button>
+      <div style={{ padding: "0 20px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "#71828E", textTransform: "uppercase" }}>Batch</div>
+          {batches.length > 1 ? (
+            <select value={batchId} onChange={(e) => onChangeBatch(e.target.value)} style={pickerStyle} aria-label="Batch">
+              {batches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+            </select>
+          ) : (
+            <div style={{ fontSize: 12.5, color: "#EDEFEA", fontWeight: 600, marginTop: 2 }}>{batchName}</div>
+          )}
+        </div>
+        {semesters.length > 0 && (
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "#71828E", textTransform: "uppercase" }}>Semester</div>
+            {semesters.length > 1 ? (
+              <select value={semesterId || ""} onChange={(e) => onChangeSemester(e.target.value)} style={pickerStyle} aria-label="Semester">
+                {semesters.map((s) => <option key={s.id} value={s.id}>{s.name}{s.is_current ? " (current)" : ""}</option>)}
+              </select>
+            ) : (
+              <div style={{ fontSize: 12.5, color: "#EDEFEA", fontWeight: 600, marginTop: 2 }}>{semesterName}</div>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={{ padding: "6px 12px", display: "flex", flexDirection: "column", gap: 3 }}>
-        {user.role === "admin" && <GlobalBtn active={activeTab === "org"} onClick={onOpenOrg} icon={TrendingUp} label="Organization dashboard" />}
-        {user.role === "admin" && <GlobalBtn active={activeTab === "reports"} onClick={onOpenReports} icon={FileChartColumn} label="MIS reports" />}
-        <GlobalBtn active={activeTab === "monthly"} onClick={onOpenMonthly} icon={CalendarRange} label="Monthly calendar" />
-        <GlobalBtn active={activeTab === "weekly-sched"} onClick={onOpenWeeklySched} icon={CalendarClock} label="Weekly schedule" />
-        {user.role === "admin" && <GlobalBtn active={activeTab === "payout"} onClick={onOpenPayout} icon={Wallet} label="Faculty payout" />}
-        {user.role === "admin" && <GlobalBtn active={activeTab === "fees"} onClick={onOpenFees} icon={Receipt} label="Student fees" />}
-        {user.role === "admin" && <GlobalBtn active={activeTab === "batches"} onClick={onOpenBatches} icon={Layers} label="Batches" />}
-        {user.role === "student" && <GlobalBtn active={activeTab === "myresults"} onClick={onOpenMyResults} icon={Award} label="My Results" />}
-        {user.role === "admin" && <GlobalBtn active={activeTab === "credentials"} onClick={onOpenCredentials} icon={Settings} label="Credentials" />}
-        {user.role === "admin" && <GlobalBtn active={activeTab === "audit"} onClick={onOpenAudit} icon={History} label="Audit log" />}
+        {isAdmin && <GlobalBtn tab="org" icon={TrendingUp} label="Organization dashboard" />}
+        {isAdmin && <GlobalBtn tab="reports" icon={FileChartColumn} label="MIS reports" />}
+        <GlobalBtn tab="monthly" icon={CalendarRange} label="Monthly calendar" />
+        <GlobalBtn tab="weekly-sched" icon={CalendarClock} label="Weekly schedule" />
+        {isAdmin && <GlobalBtn tab="subjects" icon={GraduationCap} label="Semesters & subjects" />}
+        {isAdmin && <GlobalBtn tab="payout" icon={Wallet} label="Faculty payout" />}
+        {isAdmin && <GlobalBtn tab="fees" icon={Receipt} label="Student fees" />}
+        {isAdmin && <GlobalBtn tab="batches" icon={Layers} label="Batches" />}
+        {user.role === "student" && <GlobalBtn tab="myresults" icon={Award} label="My Results" />}
+        {isAdmin && <GlobalBtn tab="credentials" icon={Settings} label="Credentials & faculty" />}
+        {isAdmin && <GlobalBtn tab="audit" icon={History} label="Audit log" />}
       </div>
 
       <div style={{ padding: "14px 20px 6px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6, color: "#71828E", textTransform: "uppercase" }}>
-        {visibleCourses.length > 1 ? "Courses" : "Your course"}
+        {user.role === "faculty" ? (courses.length > 1 ? "Your subjects" : "Your subject") : "Subjects"}
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "0 12px" }}>
-        {visibleCourses.length === 0 && <div style={{ fontSize: 12, color: "#8FA0AE", padding: "8px 12px" }}>No courses in this batch yet.</div>}
-        {visibleCourses.map((c: CourseSummary) => {
-          const active = c.id === activeCourseId && !["org","monthly","weekly-sched","credentials","audit","batches","payout","fees","myresults","reports"].includes(activeTab);
+        {courses.length === 0 && <div style={{ fontSize: 12, color: "#8FA0AE", padding: "8px 12px" }}>No subjects in this semester yet.</div>}
+        {courses.map((c) => {
+          const active = c.id === activeCourseId && !GLOBAL_TABS.includes(activeTab);
           return (
             <button key={c.id} onClick={() => onSelectCourse(c.id)}
               style={{ width: "100%", textAlign: "left", padding: "10px 12px", marginBottom: 3, borderRadius: 8, border: "none", cursor: "pointer",
@@ -484,7 +612,7 @@ function StatCard({ icon: Icon, label, value, sub, accent }: any) {
   );
 }
 
-function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { courses: CourseSummary[]; batchId: string; onSelectCourse: (id: string) => void; onOpenReports: () => void }) {
+function OrgDashboard({ courses, batchId, semesterId, scopeName, onSelectCourse, onOpenReports }: { courses: CourseSummary[]; batchId: string; semesterId: string | null; scopeName: string; onSelectCourse: (id: string) => void; onOpenReports: () => void }) {
   const [stats, setStats] = useState<any>(null);
   const [progress, setProgress] = useState<Record<string, number>>({});
   const [attendanceByCourse, setAttendanceByCourse] = useState<any[]>([]);
@@ -541,7 +669,7 @@ function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { cou
       <div style={{ marginBottom: 24, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
         <div>
           <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Organization dashboard</div>
-          <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Live progress across all {courses.length} courses</div>
+          <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Live progress across all {courses.length} subjects · {scopeName}</div>
         </div>
         <button onClick={onOpenReports} style={{ display: "flex", alignItems: "center", gap: 7, padding: "9px 16px", borderRadius: 8, border: "none", background: THEME.navy, color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
           <FileChartColumn size={15} /> Download MIS report
@@ -554,7 +682,7 @@ function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { cou
           <StatCard icon={ClipboardList} label="Upcoming deadlines" value={stats.upcomingCount} sub={stats.nextAssignment ? `Next: ${stats.nextAssignment}` : "None scheduled"} />
           <StatCard icon={FileText} label="Upcoming tests" value={stats.testCount} sub={stats.nextTestDate ? `Next: ${new Date(stats.nextTestDate).toLocaleDateString("en-IN")}` : "None scheduled"} />
           <StatCard icon={ClipboardCheck} label="Average attendance" value={overallAvgAttendance !== null ? `${overallAvgAttendance}%` : "No data yet"} sub="Course lectures only — see combined below" accent={overallAvgAttendance !== null && overallAvgAttendance < 75 ? "#C23B3B" : THEME.green} />
-          <StatCard icon={Users} label="Faculty" value={courses.length} sub="Active courses" />
+          <StatCard icon={Users} label="Faculty" value={new Set(courses.map((c) => c.faculty_id)).size} sub={`Teaching ${courses.length} subject${courses.length === 1 ? "" : "s"}`} />
         </div>
       )}
 
@@ -575,7 +703,7 @@ function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { cou
         </>
       )}
 
-      <CombinedAttendanceTable batchId={batchId} />
+      <CombinedAttendanceTable batchId={batchId} semesterId={semesterId} />
 
       <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 12 }}>Course progress</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -586,7 +714,7 @@ function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { cou
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", marginBottom: 8 }}>
                 <div>
                   <div style={{ fontSize: 14, fontWeight: 600, color: THEME.navy }}>{c.name}</div>
-                  <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 2 }}>{c.faculty_name} · {c.day_allocated}s</div>
+                  <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 2 }}>{c.faculty_name}{c.day_allocated ? ` · ${c.day_allocated}s` : ""}</div>
                 </div>
                 <ChevronRight size={16} color={THEME.textFaint} />
               </div>
@@ -604,10 +732,10 @@ function OrgDashboard({ courses, batchId, onSelectCourse, onOpenReports }: { cou
   );
 }
 
-function CombinedAttendanceTable({ batchId }: { batchId: string }) {
+function CombinedAttendanceTable({ batchId, semesterId }: { batchId: string; semesterId: string | null }) {
   const [data, setData] = useState<any>(null);
 
-  useEffect(() => { api(`/api/attendance-summary?batchId=${batchId}`).then(setData); }, [batchId]);
+  useEffect(() => { api(`/api/attendance-summary?batchId=${batchId}${semesterId ? `&semesterId=${semesterId}` : ""}`).then(setData); }, [batchId, semesterId]);
 
   if (!data) return null;
 
@@ -649,7 +777,7 @@ function CombinedAttendanceTable({ batchId }: { batchId: string }) {
 }
 
 function WeeklyCalendar({ courses, user, onSaved, onSelectCourse }: any) {
-  const canEditCourse = (c: CourseSummary) => user.role === "admin" || (user.role === "faculty" && user.courseId === c.id);
+  const canEditCourse = (c: CourseSummary) => user.role === "admin" || (user.role === "faculty" && c.faculty_id === user.id);
   const draft = useDraft("weekly-schedule", onSaved);
   // Day and parity are saved together in one request per course.
   const schedOf = (c: CourseSummary) => draft.get(`sched:${c.id}`, { day: c.day_allocated, parity: c.day_parity });
@@ -688,11 +816,11 @@ function WeeklyCalendar({ courses, user, onSaved, onSelectCourse }: any) {
                       </button>
                       {canEditCourse(c) && (
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
-                          <select value={c.day_allocated} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: e.target.value, parity: c.day_parity })} onClick={(e) => e.stopPropagation()}
+                          <select value={c.day_allocated || ""} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: e.target.value, parity: c.day_parity })} onClick={(e) => e.stopPropagation()}
                             style={{ width: "100%", padding: "5px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 10.5, background: THEME.bg, color: THEME.textMuted }}>
                             {DAYS_ORDER.map((d) => <option key={d} value={d}>{d}</option>)}
                           </select>
-                          <select value={c.day_parity || "every"} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: c.day_allocated, parity: e.target.value === "every" ? null : e.target.value })} onClick={(e) => e.stopPropagation()}
+                          <select value={c.day_parity || "every"} onChange={(e) => stageSched(courses.find((x: CourseSummary) => x.id === c.id), { day: c.day_allocated || "", parity: e.target.value === "every" ? null : e.target.value })} onClick={(e) => e.stopPropagation()}
                             style={{ width: "100%", padding: "5px 6px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 10.5, background: THEME.bg, color: THEME.textMuted }}>
                             <option value="every">Every week</option>
                             <option value="odd">Odd weeks only</option>
@@ -955,18 +1083,30 @@ function BatchesPanel({ batches, onChanged }: { batches: Batch[]; onChanged: () 
   );
 }
 
-function CredentialsPanel({ batchId, students, onStudentsChanged }: { batchId: string; students: StudentRow[]; onStudentsChanged: () => Promise<unknown> | void }) {
+type FacultyRow = { id: string; name: string; username: string; pay_rate: number | null; subjects: { id: string; name: string; batch_name: string; semester_name: string | null }[] };
+
+function CredentialsPanel({ batchId, students, onStudentsChanged, onFacultyChanged }: { batchId: string; students: StudentRow[]; onStudentsChanged: () => Promise<unknown> | void; onFacultyChanged: () => Promise<unknown> | void }) {
   const [creds, setCreds] = useState<any>(null);
+  const [faculty, setFaculty] = useState<FacultyRow[] | null>(null);
+  const [showAddFaculty, setShowAddFaculty] = useState(false);
+  const [facultyError, setFacultyError] = useState("");
   const [toDelete, setToDelete] = useState<StudentRow[] | null>(null);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [showAdd, setShowAdd] = useState(false);
   const selectedStudents = students.filter((s) => selected[s.id]);
   const allSelected = students.length > 0 && selectedStudents.length === students.length;
   const loadCreds = useCallback(() => api("/api/admin/credentials").then(setCreds), []);
-  useEffect(() => { loadCreds(); }, [loadCreds]);
-  const draft = useDraft("credentials", async () => { await Promise.all([loadCreds(), onStudentsChanged()]); });
+  const loadFaculty = useCallback(() => api("/api/faculty").then((d) => setFaculty(d.faculty || [])), []);
+  useEffect(() => { loadCreds(); loadFaculty(); }, [loadCreds, loadFaculty]);
+  const draft = useDraft("credentials", async () => { await Promise.all([loadCreds(), loadFaculty(), onStudentsChanged(), onFacultyChanged()]); });
+  const removeFaculty = async (f: FacultyRow) => {
+    if (!window.confirm(`Delete ${f.name}'s faculty account? They will no longer be able to log in.`)) return;
+    setFacultyError("");
+    try { await api(`/api/faculty/${f.id}`, { method: "DELETE" }); draft.drop((k) => k.startsWith(`fac:${f.id}:`)); await loadFaculty(); }
+    catch (e: any) { setFacultyError(e.message); }
+  };
   const inputStyle = { padding: "6px 9px", borderRadius: 6, border: `1px solid ${THEME.border}`, fontSize: 12.5 };
-  if (!creds) return <div style={{ color: THEME.textMuted, fontSize: 13 }}>Loading credentials...</div>;
+  if (!creds || !faculty) return <div style={{ color: THEME.textMuted, fontSize: 13 }}>Loading credentials...</div>;
 
   const patchUser = (userId: string, body: object) => api("/api/admin/credentials", { method: "PATCH", body: JSON.stringify({ userId, ...body }) });
   const patchStudent = (id: string, body: object) => api(`/api/students/${id}`, { method: "PATCH", body: JSON.stringify(body) });
@@ -980,8 +1120,8 @@ function CredentialsPanel({ batchId, students, onStudentsChanged }: { batchId: s
   return (
     <div key={draft.version}>
       <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Credentials</div>
-        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Only visible to you. Manage every login, student name, and pay rate from here. Changes apply when you click Save.</div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Credentials &amp; faculty</div>
+        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>Only visible to you. Add and manage faculty, every login, student names and pay rates here. Edits apply when you click Save.</div>
       </div>
 
       <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
@@ -993,14 +1133,38 @@ function CredentialsPanel({ batchId, students, onStudentsChanged }: { batchId: s
       </div>
 
       <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 12 }}>Faculty logins & pay rates</div>
-        {creds.faculty.map((f: any) => (
-          <div key={`${f.id}-${f.course_id}`} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "8px 0", borderBottom: `1px solid ${THEME.border}` }}>
-            <div style={{ fontSize: 12.5, minWidth: 150 }}>{f.name}</div>
-            {Field({ k: `fac:${f.id}:username`, original: f.username, width: 130, placeholder: "Username", commit: (v) => patchUser(f.id, { username: v }) })}
-            {Field({ k: `fac:${f.id}:password`, original: "", width: 110, placeholder: "New password", commit: (v) => (v ? patchUser(f.id, { password: v }) : Promise.resolve()) })}
-            <span style={{ fontSize: 11.5, color: THEME.textMuted }}>Pay rate ₹/hr:</span>
-            {Field({ k: `fac:${f.id}:payRate`, original: String(f.pay_rate ?? 800), width: 70, type: "number", commit: (v) => patchUser(f.id, { payRate: v }) })}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, marginBottom: 4 }}>Faculty <span style={{ fontWeight: 500, color: THEME.textMuted }}>· {faculty.length} member{faculty.length === 1 ? "" : "s"}</span></div>
+            <div style={{ fontSize: 12, color: THEME.textMuted }}>Add a faculty member here, then assign their subjects in Semesters &amp; subjects. One person can teach several subjects.</div>
+          </div>
+          <button onClick={() => setShowAddFaculty((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 8, border: "none", background: THEME.green, color: "white", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+            <UserPlus size={14} /> Add faculty
+          </button>
+        </div>
+        {showAddFaculty && <AddFacultyForm onCancel={() => setShowAddFaculty(false)} onAdded={async () => { await loadFaculty(); await onFacultyChanged(); }} />}
+        {facultyError && <div style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: "#FCEBEB", color: "#A32D2D", fontSize: 12.5 }}>{facultyError}</div>}
+        {faculty.length === 0 && <div style={{ fontSize: 12.5, color: THEME.textFaint, padding: "8px 0" }}>No faculty yet. Click “Add faculty”.</div>}
+        {faculty.map((f) => (
+          <div key={f.id} style={{ padding: "10px 0", borderBottom: `1px solid ${THEME.border}` }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              {Field({ k: `fac:${f.id}:name`, original: f.name, width: 170, placeholder: "Full name", commit: (v) => patchUser(f.id, { name: v }) })}
+              {Field({ k: `fac:${f.id}:username`, original: f.username, width: 130, placeholder: "Username", commit: (v) => patchUser(f.id, { username: v }) })}
+              {Field({ k: `fac:${f.id}:password`, original: "", width: 110, placeholder: "New password", commit: (v) => (v ? patchUser(f.id, { password: v }) : Promise.resolve()) })}
+              <span style={{ fontSize: 11.5, color: THEME.textMuted }}>Pay rate ₹/hr:</span>
+              {Field({ k: `fac:${f.id}:payRate`, original: String(Number(f.pay_rate ?? 800)), width: 70, type: "number", commit: (v) => patchUser(f.id, { payRate: v }) })}
+              <button onClick={() => removeFaculty(f)} title={f.subjects.length ? "Reassign their subjects before deleting" : `Delete ${f.name}`}
+                style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 6, border: "1px solid #F1C9C9", background: "#FFF5F5", color: "#A32D2D", fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+                <Trash2 size={13} /> Delete
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+              {f.subjects.length === 0 ? <span style={{ fontSize: 11.5, color: THEME.orange }}>No subjects assigned yet</span> : f.subjects.map((sub) => (
+                <span key={sub.id} style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: THEME.bg, border: `1px solid ${THEME.border}`, color: THEME.textMuted }}>
+                  {sub.name}{sub.semester_name ? ` · ${sub.semester_name}` : ""} · {sub.batch_name}
+                </span>
+              ))}
+            </div>
           </div>
         ))}
       </div>
@@ -1060,6 +1224,42 @@ function CredentialsPanel({ batchId, students, onStudentsChanged }: { batchId: s
             await onStudentsChanged();
           }} />
       )}
+    </div>
+  );
+}
+
+function AddFacultyForm({ onCancel, onAdded }: { onCancel: () => void; onAdded: () => Promise<unknown> }) {
+  const blank = { name: "", username: "", password: "", payRate: "800" };
+  const [form, setForm] = useState(blank);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [lastAdded, setLastAdded] = useState("");
+  const field = { padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13 };
+
+  const submit = async () => {
+    setBusy(true); setError("");
+    try {
+      const d = await api("/api/faculty", { method: "POST", body: JSON.stringify(form) });
+      setLastAdded(`${d.faculty.name} added (username: ${d.faculty.username}). Assign their subjects in Semesters & subjects.`);
+      setForm(blank);
+      await onAdded();
+    } catch (e: any) { setError(e.message || "Could not add the faculty member."); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ marginBottom: 14, padding: 14, borderRadius: 10, border: `1px solid ${THEME.green}`, background: "#F8FCF2" }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: THEME.navy, marginBottom: 10 }}>Add a new faculty member</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Full name</label><br /><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Ms. Neha Rao" style={{ ...field, width: 180 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Username</label><br /><input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value.replace(/\s/g, "") })} placeholder="e.g. neha.rao" style={{ ...field, width: 140 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Password</label><br /><input value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="At least 4 characters" style={{ ...field, width: 150 }} /></div>
+        <div><label style={{ fontSize: 11.5, color: THEME.textMuted }}>Pay rate ₹/hr</label><br /><input type="number" min={0} value={form.payRate} onChange={(e) => setForm({ ...form, payRate: e.target.value })} style={{ ...field, width: 90 }} /></div>
+        <button onClick={submit} disabled={busy} style={{ padding: "9px 18px", borderRadius: 7, border: "none", background: THEME.green, color: "white", fontSize: 13, fontWeight: 700, cursor: busy ? "default" : "pointer", opacity: busy ? 0.7 : 1 }}>{busy ? "Adding…" : "Add faculty"}</button>
+        <button onClick={onCancel} style={{ padding: "9px 14px", borderRadius: 7, border: `1px solid ${THEME.border}`, background: THEME.card, fontSize: 13, cursor: "pointer" }}>Close</button>
+      </div>
+      {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#A32D2D" }}>{error}</div>}
+      {lastAdded && !error && <div style={{ marginTop: 10, fontSize: 12.5, color: THEME.greenDark, fontWeight: 600 }}>✓ {lastAdded}</div>}
     </div>
   );
 }
@@ -1159,6 +1359,433 @@ function DeleteStudentDialog({ students, onClose, onDeleted }: { students: Stude
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// SEMESTERS & SUBJECTS (admin)
+// Add semesters to a batch, add/edit/delete the subjects in each semester,
+// and edit every subject's modules and internal-assessment pattern.
+// ─────────────────────────────────────────────────────────────
+type PatternRow = { id?: string; name: string; maxMarks: number | string };
+type ModuleDraftRow = { id?: string; name: string; status?: string };
+
+const PATTERN_PRESETS: { key: string; label: string; rows: PatternRow[] }[] = [
+  { key: "project", label: "Micro Project · Viva · Attendance & Attitude · Presentation & Viva", rows: [
+    { name: "Micro Project", maxMarks: 10 }, { name: "Viva (Micro Project)", maxMarks: 10 },
+    { name: "Attendance & Attitude", maxMarks: 10 }, { name: "Presentation & Viva", maxMarks: 20 }] },
+  { key: "tests", label: "Test 1–4 · Attendance", rows: [
+    { name: "Test 1", maxMarks: 10 }, { name: "Test 2", maxMarks: 10 }, { name: "Test 3", maxMarks: 10 },
+    { name: "Test 4", maxMarks: 10 }, { name: "Attendance", maxMarks: 10 }] },
+];
+
+const smallBtn = (tone: "plain" | "green" | "navy" | "red" = "plain") => ({
+  display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", borderRadius: 7, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+  border: tone === "plain" ? `1px solid ${THEME.border}` : tone === "red" ? "1px solid #F1C9C9" : "none",
+  background: tone === "green" ? THEME.green : tone === "navy" ? THEME.navy : tone === "red" ? "#FFF5F5" : THEME.card,
+  color: tone === "green" || tone === "navy" ? "white" : tone === "red" ? "#A32D2D" : THEME.navy,
+} as const);
+const inputBox = { padding: "8px 10px", borderRadius: 7, border: `1px solid ${THEME.border}`, fontSize: 13, background: THEME.card, boxSizing: "border-box" as const };
+const labelStyle = { fontSize: 11.5, color: THEME.textMuted, display: "block", marginBottom: 4 } as const;
+
+function SubjectsPanel({ batchId, batchName, semesters, courses, selectedSemesterId, onSelectSemester, onChanged, onOpenCourse, onOpenCredentials }: {
+  batchId: string; batchName: string; semesters: Semester[]; courses: CourseSummary[]; selectedSemesterId: string | null;
+  onSelectSemester: (id: string) => void; onChanged: () => Promise<unknown>; onOpenCourse: (id: string) => void; onOpenCredentials: () => void;
+}) {
+  const [faculty, setFaculty] = useState<FacultyRow[] | null>(null);
+  const [editing, setEditing] = useState<string | null>(null); // a subject id, "new", or null
+  const [showAddSem, setShowAddSem] = useState(false);
+  const [newSem, setNewSem] = useState({ name: "", copyFrom: "" });
+  const [semName, setSemName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [toDelete, setToDelete] = useState<CourseSummary | null>(null);
+
+  useEffect(() => { api("/api/faculty").then((d) => setFaculty(d.faculty || [])); }, []);
+  const semId = semesters.some((s) => s.id === selectedSemesterId) ? selectedSemesterId! : semesters[0]?.id;
+  const sem = semesters.find((s) => s.id === semId);
+  useEffect(() => { setSemName(sem?.name || ""); setEditing(null); setError(""); }, [sem?.id, sem?.name]);
+
+  const semSubjects = courses.filter((c) => semesterOf(c, semesters) === semId).sort((a, b) => a.name.localeCompare(b.name));
+  const nextNumber = (semesters.reduce((m, s) => Math.max(m, s.semester_number), 0) || 0) + 1;
+
+  const run = async (fn: () => Promise<unknown>) => {
+    setBusy(true); setError("");
+    try { await fn(); await onChanged(); } catch (e: any) { setError(e.message || "Something went wrong."); }
+    finally { setBusy(false); }
+  };
+  const addSemester = () => run(async () => {
+    const d = await api("/api/semesters", { method: "POST", body: JSON.stringify({ batchId, name: newSem.name.trim() || undefined, copyFromSemesterId: newSem.copyFrom || undefined }) });
+    setShowAddSem(false); setNewSem({ name: "", copyFrom: "" });
+    await onChanged();
+    onSelectSemester(d.semester.id);
+  });
+  const renameSemester = () => run(() => api(`/api/semesters/${semId}`, { method: "PATCH", body: JSON.stringify({ name: semName }) }));
+  const makeCurrent = () => run(() => api(`/api/semesters/${semId}`, { method: "PATCH", body: JSON.stringify({ isCurrent: true }) }));
+  const deleteSemester = () => {
+    if (!sem || !window.confirm(`Delete ${sem.name}? It has no subjects, so nothing else is removed.`)) return;
+    run(async () => { await api(`/api/semesters/${semId}`, { method: "DELETE" }); const other = semesters.find((s) => s.id !== semId); if (other) onSelectSemester(other.id); });
+  };
+
+  if (!faculty) return <div style={{ color: THEME.textMuted, fontSize: 13 }}>Loading…</div>;
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: THEME.navy }}>Semesters &amp; subjects</div>
+        <div style={{ fontSize: 13.5, color: THEME.textMuted, marginTop: 4 }}>
+          {batchName}. Add a semester, then add its subjects. For each subject you can set the faculty, timetable, modules and internal marks pattern.
+        </div>
+      </div>
+
+      {/* Semester tabs */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+        {semesters.map((s) => {
+          const active = s.id === semId;
+          return (
+            <button key={s.id} onClick={() => onSelectSemester(s.id)} style={{ padding: "9px 14px", borderRadius: 10, cursor: "pointer", textAlign: "left",
+              border: `1.5px solid ${active ? THEME.green : THEME.border}`, background: active ? THEME.greenLight : THEME.card }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: THEME.navy, display: "flex", alignItems: "center", gap: 6 }}>
+                {s.name}{s.is_current && <span style={{ fontSize: 9.5, fontWeight: 700, padding: "1px 6px", borderRadius: 10, background: THEME.green, color: "white" }}>CURRENT</span>}
+              </div>
+              <div style={{ fontSize: 11, color: THEME.textMuted, marginTop: 2 }}>{s.subject_count} subject{s.subject_count === 1 ? "" : "s"}</div>
+            </button>
+          );
+        })}
+        <button onClick={() => setShowAddSem((v) => !v)} style={{ ...smallBtn("plain"), padding: "12px 14px", borderStyle: "dashed", borderRadius: 10 }}>
+          <Plus size={14} /> Add semester
+        </button>
+      </div>
+
+      {showAddSem && (
+        <div style={{ padding: 14, borderRadius: 12, border: `1px solid ${THEME.green}`, background: "#F8FCF2", marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: THEME.navy, marginBottom: 10 }}>Add a new semester to {batchName}</div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div><label style={labelStyle}>Name</label><input value={newSem.name} onChange={(e) => setNewSem({ ...newSem, name: e.target.value })} placeholder={`Semester ${nextNumber}`} style={{ ...inputBox, width: 180 }} /></div>
+            <div>
+              <label style={labelStyle}>Start with</label>
+              <select value={newSem.copyFrom} onChange={(e) => setNewSem({ ...newSem, copyFrom: e.target.value })} style={{ ...inputBox, minWidth: 260 }}>
+                <option value="">No subjects (I'll add them)</option>
+                {semesters.filter((s) => s.subject_count > 0).map((s) => <option key={s.id} value={s.id}>A copy of {s.name}'s subjects ({s.subject_count})</option>)}
+              </select>
+            </div>
+            <button onClick={addSemester} disabled={busy} style={smallBtn("green")}>{busy ? "Adding…" : "Add semester"}</button>
+            <button onClick={() => setShowAddSem(false)} style={smallBtn("plain")}>Cancel</button>
+          </div>
+          {newSem.copyFrom && <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 8 }}>The copy keeps subject names, faculty, timetable, modules and internal pattern — with no attendance, marks or progress. You can then edit or delete each one.</div>}
+        </div>
+      )}
+
+      {error && <div style={{ marginBottom: 14, padding: "9px 12px", borderRadius: 8, background: "#FCEBEB", color: "#A32D2D", fontSize: 12.5 }}>{error}</div>}
+
+      {sem && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", padding: 12, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, marginBottom: 16 }}>
+          <input value={semName} onChange={(e) => setSemName(e.target.value)} style={{ ...inputBox, width: 200, ...dirtyStyle(semName !== sem.name) }} aria-label="Semester name" />
+          {semName.trim() && semName !== sem.name && <button onClick={renameSemester} disabled={busy} style={smallBtn("green")}><Save size={13} /> Save name</button>}
+          <div style={{ flex: 1 }} />
+          {sem.is_current
+            ? <span style={{ fontSize: 12, color: THEME.greenDark, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5 }}><Star size={13} /> Current semester — students and faculty open this one by default</span>
+            : <button onClick={makeCurrent} disabled={busy} style={smallBtn("navy")}><Star size={13} /> Make this the current semester</button>}
+          {semesters.length > 1 && semSubjects.length === 0 && <button onClick={deleteSemester} disabled={busy} style={smallBtn("red")}><Trash2 size={13} /> Delete semester</button>}
+        </div>
+      )}
+
+      {faculty.length === 0 && (
+        <div style={{ marginBottom: 14, padding: "10px 12px", borderRadius: 8, background: THEME.orangeLight, color: THEME.orange, fontSize: 12.5 }}>
+          Add at least one faculty member first — every subject needs one. <button onClick={onOpenCredentials} style={{ background: "none", border: "none", color: THEME.navy, fontWeight: 700, cursor: "pointer", textDecoration: "underline", padding: 0 }}>Go to Credentials &amp; faculty</button>
+        </div>
+      )}
+
+      {/* Subjects in this semester */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: THEME.navy }}>Subjects in {sem?.name}</div>
+        {editing !== "new" && faculty.length > 0 && <button onClick={() => { if (confirmLeave()) setEditing("new"); }} style={smallBtn("green")}><Plus size={14} /> Add subject</button>}
+      </div>
+
+      {editing === "new" && sem && (
+        <SubjectForm key="new" batchId={batchId} semesters={semesters} semesterId={sem.id} faculty={faculty} allCourses={courses}
+          onCancel={() => setEditing(null)} onSaved={async () => { setEditing(null); await onChanged(); }} onOpenCredentials={onOpenCredentials} />
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {semSubjects.length === 0 && editing !== "new" && <div style={{ padding: 20, border: `1px dashed ${THEME.border}`, borderRadius: 12, textAlign: "center", fontSize: 13, color: THEME.textFaint }}>No subjects in this semester yet.</div>}
+        {semSubjects.map((c) => editing === c.id ? (
+          <SubjectForm key={c.id} course={c} batchId={batchId} semesters={semesters} semesterId={semId!} faculty={faculty} allCourses={courses}
+            onCancel={() => setEditing(null)} onSaved={async () => { setEditing(null); await onChanged(); }} onOpenCredentials={onOpenCredentials} />
+        ) : (
+          <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: THEME.navy }}>{c.name} <span style={{ fontSize: 11, fontWeight: 600, color: THEME.textFaint }}>{c.code}</span></div>
+              <div style={{ fontSize: 12, color: THEME.textMuted, marginTop: 3 }}>
+                {[c.faculty_name, c.day_allocated ? `${c.day_allocated}s${weekParityLabel(c.day_parity) ? ` (${weekParityLabel(c.day_parity)})` : ""}` : "No day set", c.total_hours ? `${c.total_hours} hours` : null].filter(Boolean).join(" · ")}
+              </div>
+            </div>
+            <button onClick={() => onOpenCourse(c.id)} style={smallBtn("plain")}>Open</button>
+            <button onClick={() => { if (confirmLeave()) setEditing(c.id); }} style={smallBtn("plain")}><Pencil size={13} /> Edit setup</button>
+            <button onClick={() => setToDelete(c)} style={smallBtn("red")}><Trash2 size={13} /> Delete</button>
+          </div>
+        ))}
+      </div>
+
+      {toDelete && (
+        <TypeToConfirmDialog
+          title={`Delete ${toDelete.name}?`}
+          body={<>This permanently removes the subject and everything recorded under it: modules and progress, weekly plans, assignments, tests, attendance and all marks. Faculty payout entries are kept.</>}
+          actionLabel="Delete subject"
+          onClose={() => setToDelete(null)}
+          onConfirm={async () => { await api(`/api/courses/${toDelete.id}`, { method: "DELETE" }); await onChanged(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SubjectForm({ course, batchId, semesters, semesterId, faculty, allCourses, onCancel, onSaved, onOpenCredentials }: {
+  course?: CourseSummary; batchId: string; semesters: Semester[]; semesterId: string; faculty: FacultyRow[]; allCourses: CourseSummary[];
+  onCancel: () => void; onSaved: () => Promise<unknown>; onOpenCredentials: () => void;
+}) {
+  const isNew = !course;
+  type FormState = {
+    name: string; code: string; facultyId: string; semesterId: string; day: string; parity: string; totalHours: string; externalMax: string;
+    modules: ModuleDraftRow[]; components: PatternRow[];
+  };
+  const [form, setForm] = useState<FormState | null>(null);
+  const [original, setOriginal] = useState<FormState | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      let f: FormState;
+      if (course) {
+        const d: CourseDetail = await api(`/api/courses/${course.id}`);
+        f = {
+          name: d.course.name, code: d.course.code || "", facultyId: d.course.faculty_id, semesterId: semesterId,
+          day: d.course.day_allocated || "", parity: d.course.day_parity || "", totalHours: d.course.total_hours == null ? "" : String(d.course.total_hours),
+          externalMax: String(d.course.external_max_marks ?? 50),
+          modules: d.modules.map((m) => ({ id: m.id, name: m.module_name || "", status: m.status })),
+          components: d.components.map((c) => ({ id: c.id, name: c.component_name, maxMarks: c.max_marks })),
+        };
+      } else {
+        f = {
+          name: "", code: "", facultyId: "", semesterId, day: "", parity: "", totalHours: "", externalMax: "50",
+          modules: Array.from({ length: 5 }, () => ({ name: "" })),
+          components: PATTERN_PRESETS[0].rows.map((r) => ({ ...r })),
+        };
+      }
+      setForm(f); setOriginal(JSON.parse(JSON.stringify(f)));
+    })().catch((e) => setError(e.message));
+  }, [course, semesterId, faculty]);
+
+  const dirty = !!form && !!original && JSON.stringify(form) !== JSON.stringify(original);
+  const panelId = `subject-form-${course?.id || "new"}`;
+  useEffect(() => {
+    if (dirty) dirtyPanels.add(panelId); else dirtyPanels.delete(panelId);
+    return () => { dirtyPanels.delete(panelId); };
+  }, [dirty, panelId]);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  if (!form) return <div style={{ padding: 16, border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, fontSize: 13, color: THEME.textMuted }}>{error || "Loading subject…"}</div>;
+
+  const set = (patch: Partial<FormState>) => setForm({ ...form, ...patch });
+  const move = <T,>(list: T[], i: number, dir: -1 | 1) => { const j = i + dir; if (j < 0 || j >= list.length) return list; const next = [...list]; [next[i], next[j]] = [next[j], next[i]]; return next; };
+  const internalTotal = form.components.reduce((s, c) => s + (Number(c.maxMarks) || 0), 0);
+  const ext = Number(form.externalMax) || 0;
+
+  const loadPattern = async (value: string) => {
+    if (!value) return;
+    let rows: PatternRow[] = [];
+    const preset = PATTERN_PRESETS.find((p) => `preset:${p.key}` === value);
+    if (preset) rows = preset.rows.map((r) => ({ ...r }));
+    else if (value.startsWith("copy:")) {
+      const d: CourseDetail = await api(`/api/courses/${value.slice(5)}`);
+      rows = d.components.map((c) => ({ name: c.component_name, maxMarks: c.max_marks }));
+    }
+    if (form.components.length && !window.confirm("Replace the current internal pattern with this one?")) return;
+    set({ components: rows });
+  };
+
+  const save = async () => {
+    setError("");
+    if (!form.name.trim()) { setError("Please enter the subject name."); return; }
+    if (!form.facultyId) { setError("Please choose the faculty member."); return; }
+    if (form.components.some((c) => !String(c.name).trim())) { setError("Every internal component needs a name."); return; }
+    if (form.components.some((c) => !(Number(c.maxMarks) > 0) || !Number.isInteger(Number(c.maxMarks)))) { setError("Every internal component needs whole-number marks above 0."); return; }
+    if (original && !isNew) {
+      const keptC = new Set(form.components.map((c) => c.id).filter(Boolean));
+      const removedC = original.components.filter((c) => c.id && !keptC.has(c.id));
+      const keptM = new Set(form.modules.map((m) => m.id).filter(Boolean));
+      const removedM = original.modules.filter((m) => m.id && !keptM.has(m.id));
+      const lowered = form.components.filter((c) => { const o = original.components.find((x) => x.id && x.id === c.id); return o && Number(c.maxMarks) < Number(o.maxMarks); });
+      const warnings: string[] = [];
+      if (removedC.length) warnings.push(`Removing ${removedC.map((c) => `"${c.name}"`).join(", ")} deletes any marks already entered for ${removedC.length > 1 ? "them" : "it"}.`);
+      if (lowered.length) warnings.push(`Lowering the maximum for ${lowered.map((c) => `"${c.name}"`).join(", ")} caps marks already entered above the new maximum.`);
+      if (Number(form.externalMax) < Number(original.externalMax)) warnings.push(`Lowering external marks caps any external marks already entered above ${form.externalMax}.`);
+      if (removedM.length) warnings.push(`Removing ${removedM.length} module${removedM.length > 1 ? "s" : ""} also removes ${removedM.length > 1 ? "their" : "its"} progress status.`);
+      if (warnings.length && !window.confirm(`${warnings.join("\n\n")}\n\nSave anyway?`)) return;
+    }
+    const payload = {
+      name: form.name.trim(), code: form.code.trim(), facultyId: form.facultyId, semesterId: form.semesterId,
+      dayAllocated: form.day || null, dayParity: form.day ? (form.parity || null) : null,
+      totalHours: form.totalHours === "" ? null : Number(form.totalHours), externalMaxMarks: Number(form.externalMax) || 0,
+      modules: form.modules.map((m) => ({ id: m.id, name: m.name })),
+      components: form.components.map((c) => ({ id: c.id, name: String(c.name).trim(), maxMarks: Number(c.maxMarks) })),
+    };
+    setSaving(true);
+    try {
+      if (isNew) await api("/api/courses", { method: "POST", body: JSON.stringify(payload) });
+      else await api(`/api/courses/${course!.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      dirtyPanels.delete(panelId);
+      await onSaved();
+    } catch (e: any) { setError(e.message || "Could not save."); setSaving(false); }
+  };
+
+  const otherSubjects = allCourses.filter((c) => c.id !== course?.id);
+  const iconBtn = { width: 28, height: 28, display: "inline-flex", alignItems: "center", justifyContent: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, background: THEME.card, cursor: "pointer", color: THEME.textMuted, flexShrink: 0 } as const;
+  const sectionTitle = { fontSize: 13, fontWeight: 700, color: THEME.navy, margin: "18px 0 8px" } as const;
+
+  return (
+    <div style={{ padding: 18, border: `1.5px solid ${dirty ? THEME.orange : THEME.green}`, borderRadius: 14, background: THEME.card, marginBottom: 12 }}>
+      <div style={{ fontSize: 15, fontWeight: 700, color: THEME.navy, marginBottom: 14 }}>{isNew ? "Add a subject" : `Edit ${course!.name}`}</div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 12 }}>
+        <div style={{ gridColumn: "span 2" }}><label style={labelStyle}>Subject name *</label><input value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. Financial Accounting" style={{ ...inputBox, width: "100%" }} /></div>
+        <div><label style={labelStyle}>Subject code</label><input value={form.code} onChange={(e) => set({ code: e.target.value.toUpperCase() })} placeholder="Auto if left blank" style={{ ...inputBox, width: "100%" }} /></div>
+        <div>
+          <label style={labelStyle}>Faculty *</label>
+          <select value={form.facultyId} onChange={(e) => set({ facultyId: e.target.value })} style={{ ...inputBox, width: "100%" }}>
+            {!form.facultyId && <option value="">Choose faculty…</option>}
+            {faculty.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </select>
+          <button onClick={onOpenCredentials} style={{ background: "none", border: "none", padding: 0, marginTop: 4, fontSize: 11, color: THEME.greenDark, cursor: "pointer" }}>+ Add a new faculty member</button>
+        </div>
+        <div>
+          <label style={labelStyle}>Semester</label>
+          <select value={form.semesterId} onChange={(e) => set({ semesterId: e.target.value })} style={{ ...inputBox, width: "100%" }}>
+            {semesters.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={labelStyle}>Day</label>
+          <select value={form.day} onChange={(e) => set({ day: e.target.value })} style={{ ...inputBox, width: "100%" }}>
+            <option value="">Not set</option>
+            {DAYS_ORDER.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={labelStyle}>Weeks</label>
+          <select value={form.parity} onChange={(e) => set({ parity: e.target.value })} disabled={!form.day} style={{ ...inputBox, width: "100%" }}>
+            <option value="">Every week</option><option value="odd">Odd weeks only</option><option value="even">Even weeks only</option>
+          </select>
+        </div>
+        <div><label style={labelStyle}>Total hours</label><input type="number" min={0} value={form.totalHours} onChange={(e) => set({ totalHours: e.target.value })} style={{ ...inputBox, width: "100%" }} /></div>
+      </div>
+
+      {/* Modules */}
+      <div style={sectionTitle}>Modules <span style={{ fontWeight: 500, color: THEME.textMuted }}>· {form.modules.length}</span></div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {form.modules.map((m, i) => (
+          <div key={m.id || `new-${i}`} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <div style={{ width: 26, textAlign: "center", fontSize: 12, fontWeight: 700, color: THEME.textMuted, flexShrink: 0 }}>{i + 1}</div>
+            <input value={m.name} placeholder="Module name (can be added later)" onChange={(e) => set({ modules: form.modules.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) })} style={{ ...inputBox, flex: 1, minWidth: 0 }} />
+            {m.status && m.status !== "not_started" && <span style={{ fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 20, background: STATUS_STYLES[m.status].bg, color: STATUS_STYLES[m.status].text, flexShrink: 0 }}>{STATUS_STYLES[m.status].label}</span>}
+            <button title="Move up" onClick={() => set({ modules: move(form.modules, i, -1) })} style={iconBtn}><ArrowUp size={13} /></button>
+            <button title="Move down" onClick={() => set({ modules: move(form.modules, i, 1) })} style={iconBtn}><ArrowDown size={13} /></button>
+            <button title="Remove module" onClick={() => set({ modules: form.modules.filter((_, j) => j !== i) })} style={{ ...iconBtn, color: "#A32D2D" }}><X size={13} /></button>
+          </div>
+        ))}
+      </div>
+      <button onClick={() => set({ modules: [...form.modules, { name: "" }] })} style={{ ...smallBtn("plain"), marginTop: 8 }}><Plus size={13} /> Add module</button>
+
+      {/* Internal pattern */}
+      <div style={{ ...sectionTitle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <span>Internal marks pattern</span>
+        <select value="" onChange={(e) => loadPattern(e.target.value)} style={{ ...inputBox, fontSize: 12, padding: "6px 8px", fontWeight: 500 }}>
+          <option value="">Start from a pattern…</option>
+          <optgroup label="Standard patterns">
+            {PATTERN_PRESETS.map((p) => <option key={p.key} value={`preset:${p.key}`}>{p.label}</option>)}
+          </optgroup>
+          {otherSubjects.length > 0 && (
+            <optgroup label="Copy from a subject">
+              {otherSubjects.map((c) => <option key={c.id} value={`copy:${c.id}`}>{c.name}{semesters.find((s) => s.id === semesterOf(c, semesters)) ? ` (${semesters.find((s) => s.id === semesterOf(c, semesters))!.name})` : ""}</option>)}
+            </optgroup>
+          )}
+        </select>
+      </div>
+      <div style={{ border: `1px solid ${THEME.border}`, borderRadius: 10, overflow: "hidden" }}>
+        {form.components.length === 0 && <div style={{ padding: 12, fontSize: 12.5, color: THEME.textFaint }}>No internal components. Add one below or start from a pattern.</div>}
+        {form.components.map((c, i) => (
+          <div key={c.id || `new-${i}`} style={{ display: "flex", gap: 6, alignItems: "center", padding: "8px 10px", borderBottom: `1px solid ${THEME.border}` }}>
+            <input value={c.name} placeholder="Component name, e.g. Test 1" onChange={(e) => set({ components: form.components.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) })} style={{ ...inputBox, flex: 1, minWidth: 0 }} />
+            {isAttendanceComponent(String(c.name)) && <span title="Filled automatically from the Attendance tab" style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 20, background: THEME.greenLight, color: THEME.greenDark, flexShrink: 0 }}>AUTO</span>}
+            <input type="number" min={1} value={c.maxMarks} onChange={(e) => set({ components: form.components.map((x, j) => (j === i ? { ...x, maxMarks: e.target.value } : x)) })} style={{ ...inputBox, width: 72, textAlign: "center" }} aria-label="Maximum marks" />
+            <span style={{ fontSize: 11.5, color: THEME.textMuted, flexShrink: 0 }}>marks</span>
+            <button title="Move up" onClick={() => set({ components: move(form.components, i, -1) })} style={iconBtn}><ArrowUp size={13} /></button>
+            <button title="Move down" onClick={() => set({ components: move(form.components, i, 1) })} style={iconBtn}><ArrowDown size={13} /></button>
+            <button title="Remove component" onClick={() => set({ components: form.components.filter((_, j) => j !== i) })} style={{ ...iconBtn, color: "#A32D2D" }}><X size={13} /></button>
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "10px 12px", background: THEME.bg, flexWrap: "wrap" }}>
+          <button onClick={() => set({ components: [...form.components, { name: "", maxMarks: 10 }] })} style={smallBtn("plain")}><Plus size={13} /> Add component</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, flexWrap: "wrap" }}>
+            <span style={{ color: THEME.greenDark, fontWeight: 700 }}>Internal: {internalTotal}</span>
+            <span style={{ color: THEME.textFaint }}>+</span>
+            <span style={{ color: THEME.purple, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 5 }}>External:
+              <input type="number" min={0} value={form.externalMax} onChange={(e) => set({ externalMax: e.target.value })} style={{ ...inputBox, width: 64, padding: "5px 6px", textAlign: "center" }} aria-label="External marks" />
+            </span>
+            <span style={{ color: THEME.textFaint }}>=</span>
+            <span style={{ color: THEME.navy, fontWeight: 800 }}>Total {internalTotal + ext}</span>
+          </div>
+        </div>
+      </div>
+      <div style={{ fontSize: 11.5, color: THEME.textFaint, marginTop: 6 }}>A component with “attendance” in its name is filled in automatically from the Attendance tab.</div>
+
+      {error && <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 8, background: "#FCEBEB", color: "#A32D2D", fontSize: 12.5 }}>{error}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, marginTop: 16 }}>
+        {dirty && <span style={{ fontSize: 12.5, color: THEME.orange, fontWeight: 600, marginRight: "auto" }}>Unsaved changes</span>}
+        <button onClick={() => { if (!dirty || window.confirm("Discard your changes to this subject?")) { dirtyPanels.delete(panelId); onCancel(); } }} disabled={saving} style={smallBtn("plain")}>Cancel</button>
+        <button onClick={save} disabled={saving || (!dirty && !isNew)} style={{ ...smallBtn("green"), padding: "8px 18px", opacity: saving || (!dirty && !isNew) ? 0.6 : 1 }}>
+          <Save size={14} /> {saving ? "Saving…" : isNew ? "Add subject" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TypeToConfirmDialog({ title, body, actionLabel, onClose, onConfirm }: { title: string; body: ReactNode; actionLabel: string; onClose: () => void; onConfirm: () => Promise<unknown> }) {
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const confirmed = typed.trim().toUpperCase() === "DELETE";
+  const go = async () => {
+    if (!confirmed || busy) return;
+    setBusy(true); setError("");
+    try { await onConfirm(); onClose(); } catch (e: any) { setError(e.message || "Could not delete."); setBusy(false); }
+  };
+  return (
+    <div onClick={busy ? undefined : onClose} style={{ position: "fixed", inset: 0, background: "rgba(11,29,46,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: THEME.card, borderRadius: 14, padding: 22, boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 10, background: "#FCEBEB", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><TriangleAlert size={18} color="#A32D2D" /></div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: THEME.navy }}>{title}</div>
+        </div>
+        <div style={{ fontSize: 13, color: THEME.navy, lineHeight: 1.55 }}>{body} <strong>This cannot be undone.</strong> Type <strong>DELETE</strong> to confirm.</div>
+        <input autoFocus value={typed} onChange={(e) => setTyped(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") go(); }} placeholder="Type DELETE" disabled={busy}
+          style={{ width: "100%", boxSizing: "border-box", marginTop: 12, padding: "9px 12px", borderRadius: 8, border: `1px solid ${THEME.border}`, fontSize: 13.5 }} />
+        {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#A32D2D" }}>{error}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <button onClick={onClose} disabled={busy} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${THEME.border}`, background: THEME.card, fontSize: 13, cursor: "pointer" }}>Cancel</button>
+          <button onClick={go} disabled={!confirmed || busy} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 700, background: confirmed ? "#C23B3B" : "#E8C4C4", color: "white", cursor: confirmed && !busy ? "pointer" : "default" }}>
+            <Trash2 size={14} /> {busy ? "Deleting…" : actionLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NotificationBell() {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<any[]>([]);
@@ -1207,7 +1834,7 @@ function Overview({ detail }: { detail: CourseDetail }) {
         <StatCard icon={ClipboardList} label="Next assignment" value={upcoming ? upcoming.title : "None"} sub={upcoming ? `Submission date ${new Date(upcoming.deadline).toLocaleDateString("en-IN")}` : "Nothing scheduled"} />
         <StatCard icon={Clock} label="Next test" value={nextTest ? (nextTest.test_type === "surprise" ? "Surprise" : "Internal") : "None"} sub={nextTest ? new Date(nextTest.test_date).toLocaleDateString("en-IN") : "Nothing scheduled"} />
       </div>
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 10 }}>Formative assessment components (50 marks total)</div>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: THEME.navy, marginBottom: 10 }}>Formative assessment components ({formativeMax(detail)} marks total)</div>
       <div style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, overflow: "hidden", background: THEME.card }}>
         {detail.components.map((c) => (
           <div key={c.id} style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", borderBottom: `1px solid ${THEME.border}` }}>
@@ -1217,11 +1844,11 @@ function Overview({ detail }: { detail: CourseDetail }) {
         ))}
         <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", background: THEME.bg }}>
           <span style={{ fontSize: 13.5, fontWeight: 600 }}>External / Summative marks</span>
-          <span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>50 marks</span>
+          <span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>{externalMax(detail.course)} marks</span>
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", background: THEME.navy }}>
           <span style={{ fontSize: 13.5, fontWeight: 700, color: "white" }}>Total</span>
-          <span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.green }}>100 marks</span>
+          <span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.green }}>{formativeMax(detail) + externalMax(detail.course)} marks</span>
         </div>
       </div>
     </div>
@@ -1451,6 +2078,8 @@ function Marks({ detail: savedDetail, students, courseId, isAdmin, onRefresh }: 
     scores: Object.fromEntries(students.map((s) => [s.id, Object.fromEntries(savedDetail.components.map((c) => [c.id, draft.get(scoreKey(s.id, c.id), savedDetail.scores[s.id]?.[c.id])]).filter(([, v]) => v !== undefined && v !== ""))])),
     summativeMarks: Object.fromEntries(students.map((s) => [s.id, draft.get(sumKey(s.id), savedDetail.summativeMarks[s.id])]).filter(([, v]) => v !== undefined && v !== "")),
   };
+  const fMax = formativeMax(savedDetail);
+  const eMax = externalMax(savedDetail.course);
   const togglePublish = async () => { await api(`/api/courses/${courseId}`, { method: "PATCH", body: JSON.stringify({ resultsPublished: !detail.course.results_published }) }); onRefresh(); };
 
   const downloadExcel = () => {
@@ -1470,9 +2099,9 @@ function Marks({ detail: savedDetail, students, courseId, isAdmin, onRefresh }: 
       });
       const formativeTotal = computeFormativeTotal(detail, s.id);
       const summative = detail.summativeMarks[s.id] ?? "";
-      row["Formative total (/50)"] = formativeTotal;
-      row["External / Summative (/50)"] = summative;
-      row["Grand total (/100)"] = formativeTotal + (Number(summative) || 0);
+      row[`Formative total (/${fMax})`] = formativeTotal;
+      row[`External / Summative (/${eMax})`] = summative;
+      row[`Grand total (/${fMax + eMax})`] = formativeTotal + (Number(summative) || 0);
       return row;
     });
     const ws = XLSX.utils.json_to_sheet(rows);
@@ -1500,9 +2129,9 @@ function Marks({ detail: savedDetail, students, courseId, isAdmin, onRefresh }: 
             <tr style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg }}>
               <th style={{ textAlign: "left", padding: "10px 12px" }}>Student</th>
               {detail.components.map((c) => <th key={c.id} style={{ textAlign: "center", padding: "10px 8px", fontWeight: 600, color: THEME.navy }}>{c.component_name}{isAttendanceComponent(c.component_name) ? " (auto)" : ""} <span style={{ color: THEME.textFaint, fontWeight: 400 }}>(/{c.max_marks})</span></th>)}
-              <th style={{ textAlign: "center", padding: "10px 8px", background: THEME.greenLight, color: THEME.greenDark }}>Formative total (/50)</th>
-              <th style={{ textAlign: "center", padding: "10px 8px", background: THEME.purpleLight, color: THEME.purple }}>External / Summative (/50)</th>
-              <th style={{ textAlign: "center", padding: "10px 12px", background: THEME.navy, color: "white" }}>Grand total (/100)</th>
+              <th style={{ textAlign: "center", padding: "10px 8px", background: THEME.greenLight, color: THEME.greenDark }}>Formative total (/{fMax})</th>
+              <th style={{ textAlign: "center", padding: "10px 8px", background: THEME.purpleLight, color: THEME.purple }}>External / Summative (/{eMax})</th>
+              <th style={{ textAlign: "center", padding: "10px 12px", background: THEME.navy, color: "white" }}>Grand total (/{fMax + eMax})</th>
             </tr>
           </thead>
           <tbody>
@@ -1530,7 +2159,7 @@ function Marks({ detail: savedDetail, students, courseId, isAdmin, onRefresh }: 
                   })}
                   <td style={{ padding: "7px 8px", textAlign: "center", fontWeight: 700, color: THEME.greenDark, background: "#F7FBF1" }}>{formativeTotal}</td>
                   <td style={{ padding: "7px 8px", textAlign: "center", background: "#FAF8FD" }}>
-                    {canEdit ? (<input type="number" min={0} max={50} defaultValue={summative} onChange={(e) => setSummative(s.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(sumKey(s.id))) }} />) : (summative === "" ? "-" : summative)}
+                    {canEdit ? (<input type="number" min={0} max={eMax} defaultValue={summative} onChange={(e) => setSummative(s.id, e.target.value)} style={{ width: 50, padding: "5px", textAlign: "center", borderRadius: 6, border: `1px solid ${THEME.border}`, ...dirtyStyle(draft.has(sumKey(s.id))) }} />) : (summative === "" ? "-" : summative)}
                   </td>
                   <td style={{ padding: "7px 12px", textAlign: "center", fontWeight: 700, color: THEME.navy }}>{grand}</td>
                 </tr>
@@ -1842,13 +2471,16 @@ function MyResults({ courses, studentId }: { courses: CourseSummary[]; studentId
             const summative = detail.summativeMarks[studentId] ?? 0;
             const grand = formativeTotal + (Number(summative) || 0);
             const row = detail.scores[studentId] || {};
+            const fMax = formativeMax(detail);
+            const eMax = externalMax(detail.course);
+            const gMax = fMax + eMax;
             return (
               <div key={c.id} style={{ border: `1px solid ${THEME.border}`, borderRadius: 12, background: THEME.card, overflow: "hidden" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", background: THEME.navy }}>
                   <div style={{ fontSize: 14.5, fontWeight: 700, color: "white" }}>{c.name}</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: THEME.green }}>{grand} / 100</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: THEME.green }}>{grand} / {gMax}</div>
                 </div>
-                <div style={{ padding: "10px 16px 4px", fontSize: 11.5, fontWeight: 700, letterSpacing: 0.4, color: THEME.textFaint, textTransform: "uppercase" }}>Internal marks (out of 50)</div>
+                <div style={{ padding: "10px 16px 4px", fontSize: 11.5, fontWeight: 700, letterSpacing: 0.4, color: THEME.textFaint, textTransform: "uppercase" }}>Internal marks (out of {fMax})</div>
                 {detail.components.map((comp) => {
                   let val;
                   if (isAttendanceComponent(comp.component_name)) {
@@ -1858,9 +2490,9 @@ function MyResults({ courses, studentId }: { courses: CourseSummary[]; studentId
                   } else { val = row[comp.id] ?? 0; }
                   return (<div key={comp.id} style={{ display: "flex", justifyContent: "space-between", padding: "8px 16px", borderTop: `1px solid ${THEME.border}`, fontSize: 13 }}><span>{comp.component_name}</span><span style={{ fontWeight: 600, color: THEME.navy }}>{val} / {comp.max_marks}</span></div>);
                 })}
-                <div style={{ display: "flex", justifyContent: "space-between", padding: "9px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.greenLight }}><span style={{ fontSize: 13, fontWeight: 700, color: THEME.greenDark }}>Internal total</span><span style={{ fontSize: 13, fontWeight: 700, color: THEME.greenDark }}>{formativeTotal} / 50</span></div>
-                <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.purpleLight }}><span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>External / Summative marks</span><span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>{summative} / 50</span></div>
-                <div style={{ display: "flex", justifyContent: "space-between", padding: "13px 16px", background: THEME.navy }}><span style={{ fontSize: 14, fontWeight: 700, color: "white" }}>Total marks</span><span style={{ fontSize: 14, fontWeight: 700, color: THEME.green }}>{grand} / 100 ({Math.round(grand)}%)</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", padding: "9px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.greenLight }}><span style={{ fontSize: 13, fontWeight: 700, color: THEME.greenDark }}>Internal total</span><span style={{ fontSize: 13, fontWeight: 700, color: THEME.greenDark }}>{formativeTotal} / {fMax}</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 16px", borderTop: `1px solid ${THEME.border}`, background: THEME.purpleLight }}><span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>External / Summative marks</span><span style={{ fontSize: 13.5, fontWeight: 700, color: THEME.purple }}>{summative} / {eMax}</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", padding: "13px 16px", background: THEME.navy }}><span style={{ fontSize: 14, fontWeight: 700, color: "white" }}>Total marks</span><span style={{ fontSize: 14, fontWeight: 700, color: THEME.green }}>{grand} / {gMax} ({gMax ? Math.round((grand / gMax) * 100) : 0}%)</span></div>
               </div>
             );
           })}
@@ -1870,9 +2502,11 @@ function MyResults({ courses, studentId }: { courses: CourseSummary[]; studentId
   );
 }
 
-function MisReports({ courses, batchId, batchName }: { courses: CourseSummary[]; batchId: string; batchName: string }) {
+function MisReports({ courses, batchId, semesterId, batchName }: { courses: CourseSummary[]; batchId: string; semesterId: string | null; batchName: string }) {
   const [period, setPeriod] = useState<"week" | "month" | "overall">("week");
   const [courseId, setCourseId] = useState("all");
+  // A subject from another semester can't stay selected after switching semester.
+  useEffect(() => { if (courseId !== "all" && !courses.some((c) => c.id === courseId)) setCourseId("all"); }, [courses, courseId]);
   const [data, setData] = useState<MisData | null>(null);
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
@@ -1881,12 +2515,12 @@ function MisReports({ courses, batchId, batchName }: { courses: CourseSummary[];
   useEffect(() => {
     let cancelled = false;
     setLoading(true); setError("");
-    api(`/api/reports/mis?batchId=${batchId}&period=${period}&courseId=${courseId}`)
+    api(`/api/reports/mis?batchId=${batchId}&period=${period}&courseId=${courseId}${semesterId ? `&semesterId=${semesterId}` : ""}`)
       .then((d) => { if (!cancelled) setData(d); })
       .catch((e) => { if (!cancelled) { setData(null); setError(e.message); } })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [batchId, period, courseId]);
+  }, [batchId, semesterId, period, courseId]);
 
   const download = async () => {
     if (!data) return;
