@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { query, logAudit } from "@/lib/db";
+import { query, logAudit, withTransaction } from "@/lib/db";
+import { syncComponents, syncModules, uniqueCode, validateSubject } from "@/lib/subjects";
 import { getSession } from "@/lib/auth";
 import { canEditCourse } from "@/lib/authz";
 
@@ -9,7 +10,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ cour
   const { courseId } = await params;
 
   const courseRes = await query(
-    `SELECT c.id, c.name, c.code, c.day_allocated, c.day_parity, c.total_hours, c.batch_id, c.results_published, u.name AS faculty_name
+    `SELECT c.id, c.name, c.code, c.day_allocated, c.day_parity, c.total_hours, c.batch_id, c.results_published,
+            c.semester_id, c.external_max_marks, c.faculty_id, u.name AS faculty_name
      FROM courses c JOIN users u ON u.id = c.faculty_id WHERE c.id = $1`,
     [courseId]
   );
@@ -103,4 +105,84 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ co
     : `Updated schedule for ${res.rows[0].name}`;
   await logAudit(session.id, session.name, "courses", courseId, action);
   return NextResponse.json({ course: res.rows[0] });
+}
+
+// Admin: edit a subject's setup — details, modules and internal pattern — in one save.
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ courseId: string }> }) {
+  const session = await getSession();
+  if (!session || session.role !== "admin") return NextResponse.json({ error: "Admin access only." }, { status: 403 });
+  const { courseId } = await params;
+  const body = await req.json();
+
+  const problem = validateSubject(body, { partial: true });
+  if (problem) return NextResponse.json({ error: problem }, { status: 400 });
+
+  const found = await query("SELECT id, batch_id FROM courses WHERE id = $1", [courseId]);
+  if (found.rows.length === 0) return NextResponse.json({ error: "Subject not found." }, { status: 404 });
+  if (body.facultyId) {
+    const fac = await query("SELECT id FROM users WHERE id = $1 AND role = 'faculty'", [body.facultyId]);
+    if (fac.rows.length === 0) return NextResponse.json({ error: "That faculty member was not found." }, { status: 400 });
+  }
+  if (body.semesterId) {
+    const sem = await query("SELECT id FROM semesters WHERE id = $1 AND batch_id = $2", [body.semesterId, found.rows[0].batch_id]);
+    if (sem.rows.length === 0) return NextResponse.json({ error: "That semester is not in this batch." }, { status: 400 });
+  }
+
+  const course = await withTransaction(async (client) => {
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    const add = (col: string, val: unknown) => { values.push(val); sets.push(`${col} = $${values.length}`); };
+    if (body.name !== undefined) add("name", String(body.name).trim());
+    if (body.code !== undefined) {
+      const wanted = String(body.code || "").trim();
+      const code = await uniqueCode(client, wanted, String(body.name ?? ""), courseId);
+      if (wanted && code !== wanted.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 16)) {
+        throw Object.assign(new Error(`The subject code "${wanted}" is already used by another subject.`), { userFacing: true });
+      }
+      add("code", code);
+    }
+    if (body.facultyId !== undefined) add("faculty_id", body.facultyId);
+    if (body.semesterId !== undefined) add("semester_id", body.semesterId);
+    if (body.dayAllocated !== undefined) add("day_allocated", body.dayAllocated || null);
+    if (body.dayParity !== undefined) add("day_parity", body.dayParity || null);
+    if (body.totalHours !== undefined) add("total_hours", body.totalHours === "" || body.totalHours === null ? null : Math.round(Number(body.totalHours)));
+    if (body.externalMaxMarks !== undefined) add("external_max_marks", Math.round(Number(body.externalMaxMarks)));
+    if (sets.length) {
+      values.push(courseId);
+      await client.query(`UPDATE courses SET ${sets.join(", ")} WHERE id = $${values.length}`, values);
+    }
+    if (body.externalMaxMarks !== undefined) {
+      await client.query("UPDATE summative_marks SET marks_obtained = $1 WHERE course_id = $2 AND marks_obtained > $1", [Math.round(Number(body.externalMaxMarks)), courseId]);
+    }
+    if (body.modules !== undefined) await syncModules(client, courseId, body.modules, session.id);
+    if (body.components !== undefined) await syncComponents(client, courseId, body.components);
+    const res = await client.query("SELECT id, name, code FROM courses WHERE id = $1", [courseId]);
+    return res.rows[0];
+  }).catch((err) => {
+    if (err?.userFacing) return { error: err.message as string };
+    throw err;
+  });
+  if ("error" in course) return NextResponse.json({ error: course.error }, { status: 409 });
+
+  await logAudit(session.id, session.name, "courses", courseId, `Edited subject setup for ${course.name}`);
+  return NextResponse.json({ course });
+}
+
+// Admin: delete a subject and everything recorded under it.
+export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ courseId: string }> }) {
+  const session = await getSession();
+  if (!session || session.role !== "admin") return NextResponse.json({ error: "Admin access only." }, { status: 403 });
+  const { courseId } = await params;
+
+  const found = await query("SELECT id, name FROM courses WHERE id = $1", [courseId]);
+  if (found.rows.length === 0) return NextResponse.json({ error: "Subject not found." }, { status: 404 });
+
+  await withTransaction(async (client) => {
+    // Faculty payout entries are kept (they are money records); they just lose the subject link.
+    await client.query("UPDATE faculty_sessions SET course_id = NULL WHERE course_id = $1", [courseId]);
+    await client.query("UPDATE weekly_plans SET module_id = NULL WHERE course_id = $1", [courseId]);
+    await client.query("DELETE FROM courses WHERE id = $1", [courseId]);
+  });
+  await logAudit(session.id, session.name, "courses", courseId, `Deleted subject ${found.rows[0].name}`);
+  return NextResponse.json({ ok: true });
 }
