@@ -49,10 +49,18 @@ export async function GET(req: NextRequest) {
   const batchRes = await query("SELECT id, name FROM batches WHERE id = $1", [batchId]);
   if (batchRes.rows.length === 0) return NextResponse.json({ error: "Batch not found." }, { status: 404 });
 
+  // Optional semester filter: the report then covers only that semester's subjects.
+  const semesterParam = req.nextUrl.searchParams.get("semesterId");
+  const semRes = semesterParam ? await query("SELECT id, name FROM semesters WHERE id = $1 AND batch_id = $2", [semesterParam, batchId]) : { rows: [] as any[] };
+  const semester = semRes.rows[0] || null;
+  const courseArgs: unknown[] = [batchId];
+  let courseWhere = "WHERE c.batch_id = $1";
+  if (courseId) { courseArgs.push(courseId); courseWhere += ` AND c.id = $${courseArgs.length}`; }
+  if (semester) { courseArgs.push(semester.id); courseWhere += ` AND c.semester_id = $${courseArgs.length}`; }
   const coursesRes = await query(
     `SELECT c.id, c.name, u.name AS faculty_name FROM courses c JOIN users u ON u.id = c.faculty_id
-     WHERE c.batch_id = $1 ${courseId ? "AND c.id = $2" : ""} ORDER BY c.name`,
-    courseId ? [batchId, courseId] : [batchId]
+     ${courseWhere} ORDER BY c.name`,
+    courseArgs
   );
   const courses = coursesRes.rows;
   if (courseId && courses.length === 0) return NextResponse.json({ error: "Subject not found in this batch." }, { status: 404 });
@@ -224,7 +232,7 @@ export async function GET(req: NextRequest) {
   const modulesCompleted = subjects.reduce((a, s) => a + s.completed, 0);
 
   return NextResponse.json({
-    batch: batchRes.rows[0],
+    batch: semester ? { ...batchRes.rows[0], name: `${batchRes.rows[0].name} · ${semester.name}` } : batchRes.rows[0],
     period,
     periodLabel,
     startDate: start || firstSession,
